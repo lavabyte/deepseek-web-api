@@ -1,5 +1,10 @@
 # deepseek-web-api
 
+# Notice
+This entire project was vide-coded with DeepSeek V4.1 Flash
+
+
+
 An **OpenAI-API-compatible** HTTP server that uses a `chat.deepseek.com` web session
 instead of an official API key. It exposes one model:
 
