@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.log
+data/
+tests/.token
+.probe/
