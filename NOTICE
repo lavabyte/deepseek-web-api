@@ -1,0 +1,43 @@
+deepseek-web-api
+Copyright 2026 deepseek-web-api contributors
+
+This is an unofficial project, not affiliated with, endorsed by, or sponsored
+by DeepSeek. "DeepSeek" is a trademark of its respective owner.
+
+---
+
+Third-party code
+
+The following files are vendored from the `dsh-deepseek-web-login` plugin
+(https://github.com/cv-superding/dsh-deepseek-web-login), which is licensed
+under the Apache License, Version 2.0:
+
+  src/webapi.ts
+  src/protocol.ts
+  src/auth.ts
+  src/gate.ts
+  src/accounts.ts
+  src/cookies.ts
+  src/paths.ts
+
+Copyright 2026 cv-superding (Ding Li)
+Licensed under the Apache License, Version 2.0 (see LICENSE-APACHE).
+
+These files have been modified for this project (comments translated, unused
+exports removed, features added). Modifications are Copyright 2026
+deepseek-web-api contributors and are distributed under the MIT License for
+the project as a whole; the Apache-2.0 terms continue to apply to the
+original portions.
+
+The plugin's own NOTICE states that its implementation is original work and
+that no source code from prior reverse-engineering projects was included.
+This project therefore carries no obligations toward those projects; they are
+credited in the README for protocol research only.
+
+---
+
+Protocol research acknowledgements (no code included):
+
+  Fly143/deepseek-free-api
+  LLM-Red-Team/deepseek-free-api
+  ForgetMeAI/FreeDeepseekAPI

@@ -1,0 +1,17 @@
+{
+  "name": "deepseek-web-api",
+  "version": "1.6.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible API server backed by a chat.deepseek.com web session",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node --watch src/server.mjs",
+    "smoke": "node tests/smoke.mjs",
+    "check:live": "node tests/check-live.mjs"
+  }
+}

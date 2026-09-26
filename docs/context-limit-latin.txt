@@ -1,0 +1,60 @@
+CONTEXT LIMIT — fresh session for every measurement
+filler: "This is a technical document filler sentence."
+code KOD-CZYSTY-9001 at ~50% of the document
+==========================================================================================
+
+startup control: OK
+
+--- document 1000000 / prompt 1000081 chars (~250021 tok est.) ---
+  time    : 6.6s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 2000000 / prompt 2000081 chars (~500021 tok est.) ---
+  time    : 9.5s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 2600000 / prompt 2600081 chars (~650021 tok est.) ---
+  time    : 12.6s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 3000000 / prompt 3000081 chars (~750021 tok est.) ---
+  time    : 17.8s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 3200000 / prompt 3200081 chars (~800021 tok est.) ---
+  time    : 16.2s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 3300000 / prompt 3300081 chars (~825021 tok est.) ---
+  time    : 18.3s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CZYSTY-9001"
+
+--- document 3350000 / prompt 3350081 chars (~837521 tok est.) ---
+  time    : 3.8s
+  error   : Length limit reached. Please start a new chat.
+  code    : no
+  reply   : ""
+
+--- document 3400000 / prompt 3400081 chars (~850021 tok est.) ---
+  time    : 4.1s
+  error   : Length limit reached. Please start a new chat.
+  code    : no
+  reply   : ""
+
+==========================================================================================
+Largest document read in full: 3300000 chars
+First failure: 3350000 chars
+  error : Length limit reached. Please start a new chat.
+done

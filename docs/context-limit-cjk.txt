@@ -1,0 +1,42 @@
+CONTEXT LIMIT — fresh session for every measurement
+filler: "这是一个用于测量上下文限制的技术文档填充句子。"
+code KOD-CJK-8888 at ~50% of the document
+==========================================================================================
+
+startup control: OK
+
+--- document 1000000 / prompt 1000081 chars (~666676 tok est.) ---
+  time    : 9.0s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CJK-8888"
+
+--- document 1500000 / prompt 1500081 chars (~1000009 tok est.) ---
+  time    : 13.1s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CJK-8888"
+
+--- document 2000000 / prompt 2000081 chars (~1333343 tok est.) ---
+  time    : 15.8s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CJK-8888"
+
+--- document 2200000 / prompt 2200081 chars (~1466676 tok est.) ---
+  time    : 19.7s
+  error   : (none)
+  code    : FOUND
+  reply   : "KOD-CJK-8888"
+
+--- document 2500000 / prompt 2500081 chars (~1666676 tok est.) ---
+  time    : 6.9s
+  error   : Length limit reached. Please start a new chat.
+  code    : no
+  reply   : ""
+
+==========================================================================================
+Largest document read in full: 2200000 chars
+First failure: 2500000 chars
+  error : Length limit reached. Please start a new chat.
+done
