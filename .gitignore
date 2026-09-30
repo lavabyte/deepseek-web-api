@@ -2,11 +2,11 @@ node_modules/
 .env
 *.log
 
-# Stan trwalych sesji "API" per token (data/api-sessions.json)
+# Per-token persistent session state (data/api-sessions.json)
 data/
 
-# Token do testow lokalnych (NIE commituj)
+# Local test token (do NOT commit)
 tests/.token
 
-# Jednorazowe sondy protokolu (zawieraja zrzuty odpowiedzi)
+# One-off protocol probes (contain response dumps)
 .probe/
