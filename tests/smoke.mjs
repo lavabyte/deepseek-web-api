@@ -9,12 +9,14 @@
  *   5. image (data URL)                       -> the model sees the content
  *   6. text file (base64)                     -> the model reads the content
  *   7. tool_calls (JSON protocol)             -> the call is parsed correctly
+ *   8. the token pool                          -> a comma-separated key is N accounts
  *
  * Run:
  *   DEEPSEEK_SESSION_TOKEN='<token-from-chat.deepseek.com>' node tests/smoke.mjs
  *
- * The token is this server's API KEY — it travels in the Authorization: Bearer header.
- * It can also be placed in tests/.token (gitignored).
+ * The token(s) are this server's API KEY — they travel in the Authorization: Bearer
+ * header, comma-separated for several accounts (`tok1,tok2,tok3`). A single token can also
+ * be placed in tests/.token (gitignored).
  */
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
@@ -183,12 +185,16 @@ try {
   check('stream: finish_reason present', streamed.finishReason !== null, String(streamed.finishReason))
   check('stream: usage present', Number.isFinite(streamed.usage?.total_tokens), JSON.stringify(streamed.usage))
 
-  // ── 4. one session (unnamed) ──────────────────────────────────────────
-  // /health requires a token (without it, it returns ok:true but without account verification).
+  // ── 4. token pool + one persistent session ────────────────────────────
+  // /health verifies the key against DeepSeek and reports the pool. The number of accounts
+  // is however many tokens the key lists (one, unless DEEPSEEK_SESSION_TOKEN is a list).
+  const keyTokens = TOKEN.split(',').map((t) => t.trim()).filter(Boolean)
   const health = await (await fetch(`${BASE}/health`, { headers: AUTH })).json()
-  check('health: token valid', health?.ok === true, JSON.stringify(health?.token))
-  check('health: session has no name (we do not set a title)', !('title' in (health?.session ?? {})) && !('titleApplied' in (health?.session ?? {})), JSON.stringify(health?.session))
-  check('health: session id stable', typeof health?.session?.id === 'string' && health.session.id.length > 0, health?.session?.id)
+  check('health: key valid (usable account present)', health?.ok === true, JSON.stringify(health?.pool))
+  check('health: pool reports every token in the key', health?.pool?.configured === keyTokens.length, `${health?.pool?.configured} vs ${keyTokens.length}`)
+  check('health: all accounts usable', health?.pool?.usable === keyTokens.length, JSON.stringify(health?.pool?.usable))
+  const poolSession = health?.pool?.tokens?.[0]?.session
+  check('health: persistent session created (no title field)', typeof poolSession === 'string' && poolSession.length > 0, String(poolSession))
 
   // ── 5. image ──────────────────────────────────────────────────────────
   const vision = await chat({
@@ -253,10 +259,11 @@ try {
 
   // ── 8. session still the same (no request created a new one) ──────────
   const health2 = await (await fetch(`${BASE}/health`, { headers: AUTH })).json()
-  check('persistent session unchanged after 6 requests', health2?.session?.id === health?.session?.id, `${health?.session?.id} -> ${health2?.session?.id}`)
+  const poolSession2 = health2?.pool?.tokens?.[0]?.session
+  check('persistent session unchanged after 6 requests', poolSession2 === poolSession, `${poolSession} -> ${poolSession2}`)
 
-  // ── 9. API key = web token ────────────────────────────────────────────
-  // Without a token, chat must refuse (401), while the model list stays public.
+  // ── 9. API key = web token(s) ─────────────────────────────────────────
+  // Without a key, chat must refuse (401), while the model list stays public.
   const noAuth = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -265,8 +272,15 @@ try {
   check('missing API key -> 401', noAuth.status === 401, String(noAuth.status))
   const badAuth = await fetch(`${BASE}/health`, { headers: { authorization: 'Bearer not-a-real-token' } })
   const badAuthJson = await badAuth.json().catch(() => null)
-  check('bad token -> health 503', badAuth.status === 503, `${badAuth.status} ${JSON.stringify(badAuthJson?.token)}`)
-  check('another token does not steal the session', badAuthJson?.session?.id === null, JSON.stringify(badAuthJson?.session))
+  check('bad token -> health 503', badAuth.status === 503, `${badAuth.status} usable=${badAuthJson?.pool?.usable}`)
+  check('bad token -> pool reports no usable account', badAuthJson?.pool?.usable === 0, JSON.stringify(badAuthJson?.pool?.tokens?.[0]?.state))
+
+  // A comma-separated key is a POOL, not one malformed token: two junk tokens must be seen
+  // as two accounts (both dead), not as a single token that fails to parse.
+  const multi = await fetch(`${BASE}/health`, { headers: { authorization: 'Bearer junk-one,junk-two' } })
+  const multiJson = await multi.json().catch(() => null)
+  check('comma-separated key parses as a pool of 2', multiJson?.pool?.configured === 2, JSON.stringify(multiJson?.pool?.configured))
+  check('two junk tokens -> no usable account', multiJson?.pool?.usable === 0, JSON.stringify(multiJson?.pool?.usable))
 } catch (error) {
   check('smoke without exceptions', false, error?.stack ?? String(error))
   if (serverLog) console.error('\n--- server log ---\n' + serverLog.slice(-3000))

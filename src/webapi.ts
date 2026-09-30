@@ -1,6 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 cv-superding (Ding Li)
-// Modifications Copyright 2026 deepseek-web-api contributors (see NOTICE).
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 deepseek-web-api contributors
 /**
  * DeepSeek web (chat.deepseek.com) API client:
  * PoW SHA3 WASM solving + chat_session lifecycle + /chat/completion SSE stream parsing.

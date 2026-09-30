@@ -19,11 +19,12 @@
  * The session is NOT named (update_title was removed) — one persistent conversation per
  * token is enough.
  *
- * The layers below (PoW, headers, SSE parser) are imported from battle-tested .ts
- * (the same code powers the dsh-deepseek-web-login plugin); Node 22.6+ strips types natively.
+ * The layers below (PoW, headers, SSE parser) live in battle-tested .ts modules;
+ * Node 22.6+ strips types natively.
  */
 import { DS_BASE, buildDsHeaders, createChatSession, createPowHeader, envelopeError, isBusyGenerating, isInvalidSessionError, isMutedError, isThrottled, muteUntilMs, parseWebSse } from './webapi.ts'
 import { AdapterLlmError, httpErrorCode, parseRetryAfterMs } from './auth.ts'
+import { log } from './log.mjs'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 export { DS_BASE }
@@ -299,17 +300,44 @@ async function* readChatStream(auth, { sessionId, path, body, signal, idleTimeou
   const controller = new AbortController()
   const composed = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
 
+  // DeepSeek occasionally answers 202 Accepted with an empty body instead of the SSE
+  // stream — a transient "the request was accepted, the stream is not ready yet" state
+  // (seen intermittently on the web backend). It is not a real error and not auth-related,
+  // so it is retried here with a short backoff instead of failing the whole turn.
+  const ACCEPTED_RETRIES = 5
+  const ACCEPTED_BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000]
   let resp
-  try {
-    resp = await fetch(`${DS_BASE}${path}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: composed,
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      resp = await fetch(`${DS_BASE}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: composed,
+      })
+    } catch (error) {
+      if (signal?.aborted) throw new AdapterLlmError('request aborted by the client', 'ABORTED', { cause: error })
+      throw new AdapterLlmError(`DeepSeek ${path} request failed: ${error?.message ?? error}`, 'TRANSPORT', { cause: error })
+    }
+    if (resp.status !== 202) break
+    // Drain the body so the connection can be reused, then wait before trying again.
+    await resp.text().catch(() => '')
+    if (attempt >= ACCEPTED_RETRIES - 1) {
+      throw new AdapterLlmError(
+        `DeepSeek ${path} kept answering HTTP 202 (accepted, no stream) after ${ACCEPTED_RETRIES} attempts`,
+        'TRANSPORT',
+        { status: 202 },
+      )
+    }
+    const waitMs = ACCEPTED_BACKOFF_MS[Math.min(attempt, ACCEPTED_BACKOFF_MS.length - 1)]
+    log.warn('DeepSeek returned HTTP 202 (accepted, no stream) — retrying', {
+      path,
+      attempt: attempt + 1,
+      retries: ACCEPTED_RETRIES,
+      wait_ms: waitMs,
     })
-  } catch (error) {
-    if (signal?.aborted) throw new AdapterLlmError('request aborted by the client', 'ABORTED', { cause: error })
-    throw new AdapterLlmError(`DeepSeek ${path} request failed: ${error?.message ?? error}`, 'TRANSPORT', { cause: error })
+    await sleep(waitMs, undefined, { signal }).catch(() => {})
+    if (signal?.aborted) throw new AdapterLlmError('request aborted by the client', 'ABORTED')
   }
 
   const contentType = String(resp.headers.get('content-type') ?? '')

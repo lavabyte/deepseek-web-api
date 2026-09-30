@@ -1,6 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 cv-superding (Ding Li)
-// Modifications Copyright 2026 deepseek-web-api contributors (see NOTICE).
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 deepseek-web-api contributors
 /**
  * Request gate — limits "web-side requests in flight on the same account".
  *

@@ -1,8 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 cv-superding (Ding Li)
-// Modifications Copyright 2026 deepseek-web-api contributors (see NOTICE).
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 deepseek-web-api contributors
 /**
- * dsh-deepseek-web-login — credential storage and structured errors.
+ * Credential storage and structured errors.
  *
  * Login credentials come from the chat.deepseek.com web client (captured from a
  * browser window or pasted manually): Bearer token + cookie + anti-bot

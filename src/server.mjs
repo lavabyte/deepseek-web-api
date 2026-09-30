@@ -3,106 +3,59 @@
 /**
  * OpenAI-compatible HTTP server backed by a chat.deepseek.com web session.
  *
+ * AUTH — the API key is a COMMA-SEPARATED LIST of chat.deepseek.com session tokens:
+ *
+ *     Authorization: Bearer tok1,tok2,tok3
+ *
+ * A session token is Base64 (letters, digits, `+`, `/`, `=`), so a comma never occurs
+ * inside one — the split is unambiguous. `tok1,tok2,tok3` is therefore three accounts, not
+ * one malformed key. A single token with no comma works exactly as before.
+ *
+ * Each token is a separate DeepSeek account, and the web endpoint allows only ONE
+ * generation per account at a time, so the pool spreads concurrent requests across the
+ * listed accounts (see src/pool.mjs). Sessions, rate-limit cooldowns and quotas are keyed
+ * by the individual token digest, so everything lines up.
+ *
  * Endpoints:
  *   GET  /v1/models               -> model list (one: deepseek/deepseek-v4-flash)
  *   POST /v1/chat/completions     -> chat (stream=true and false)
- *   GET  /health                  -> session state + token verification
+ *   GET  /health                  -> token-pool state (?verify=1 forces a live re-check)
  *
  * Configuration (.env):
- *   PORT                    listen port (default 8787) — the ONLY required variable
+ *   PORT                    listen port (default 8787)
  *   HOST                    interface (default 127.0.0.1)
  *   MODEL_ID                model name exposed in /v1/models
  *   MAX_PROMPT_CHARS        prompt length limit (default 1000000)
  *   AUTO_CONTINUE=0         disables automatically continuing a cut-off reply
  *   DATA_DIR                directory for session state (default ./data)
  *   ACCESS_ALLOWLIST        "all" (default) or comma-separated sha256 token hashes
- *   QUOTA_MAX_REQUESTS      0 (default, unlimited) or requests per window per token
+ *   QUOTA_MAX_REQUESTS      0 (default, unlimited) or requests per window per account
  *   QUOTA_WINDOW_MS         quota window (default 3600000 = 1 hour)
  *   SESSION_TTL_MS          drop unused session state after this (default 30 days)
  *   SESSION_MAX_ENTRIES     hard cap on stored sessions (default 1000)
- *   ACCESS_ALLOWLIST        "all" (default) or comma-separated sha256 token hashes
- *   QUOTA_MAX_REQUESTS      0 (default, unlimited) or requests per window per token
- *   QUOTA_WINDOW_MS         quota window (default 3600000 = 1 hour)
- *   SESSION_TTL_MS          drop unused session state after this (default 30 days)
- *   SESSION_MAX_ENTRIES     hard cap on stored sessions (default 1000)
- *
- * The web token is NOT configured in .env — the client passes it as the API KEY:
- *   Authorization: Bearer <token-from-chat.deepseek.com>
- * Each token gets its own persistent session (state in data/api-sessions.json).
  *
  * Run: npm start
  */
+// MUST be the first import: ESM evaluates dependencies in source order, and every module
+// below reads process.env while it initialises. Without this, .env would arrive too late
+// (see src/env.mjs).
+import './env.mjs'
+
 import { createServer } from 'node:http'
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
-import { MODEL_ID, authFromToken, verifyToken } from './deepseek.mjs'
+import { MODEL_ID } from './deepseek.mjs'
 import { log, clientIp, tokenPrefix } from './log.mjs'
-import {
-  ensureSession,
-  currentSessionId,
-  tokenKey,
-  DATA_DIR,
-} from './session.mjs'
+import { ensureSession, tokenKey, DATA_DIR } from './session.mjs'
 import { runChatCompletion } from './openai.mjs'
-import { createRequestGate } from './gate.ts'
-import { accessControlEnabled, isTokenAllowed, consumeQuota, quotaEnabled, quotaStatus } from './access.mjs'
-import { mutedFor, muteToken, cooldownStatus, DEFAULT_COOLDOWN_MS } from './ratelimit.mjs'
-
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-
-/** Minimal .env loader (no dependencies) — does not overwrite variables already set. */
-function loadEnv() {
-  const file = join(ROOT, '.env')
-  if (!existsSync(file)) return
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eq = trimmed.indexOf('=')
-    if (eq === -1) continue
-    const key = trimmed.slice(0, eq).trim()
-    let value = trimmed.slice(eq + 1).trim()
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
-    if (!(key in process.env)) process.env[key] = value
-  }
-}
-loadEnv()
+import { acquireToken, poolStatus, verifyPool, reviveTokens, reportOutcome } from './pool.mjs'
+import { accessControlEnabled, isTokenAllowed, consumeQuota, quotaEnabled } from './access.mjs'
+import { muteToken, DEFAULT_COOLDOWN_MS } from './ratelimit.mjs'
 
 const PORT = Number(process.env.PORT || 8787)
 const HOST = process.env.HOST || '127.0.0.1'
 const CREATED_AT = Math.floor(Date.now() / 1000)
-
-/**
- * Per-token request gates — serializes generations (one at a time), WITHOUT artificial
- * delays.
- *
- * An earlier version forced a random 2-4 s pause between requests and a long break after
- * 15 requests. Those pauses are disabled: the server sends requests immediately, and if
- * DeepSeek replies 429 the backoff (1s, 5s, 5s, 15s, 1min) is handled reactively in
- * openai.mjs. Serialization remains, because the web endpoint only allows ONE generation
- * per ACCOUNT.
- *
- * The gates are keyed by token, not global: the same account must be serialized, but two
- * different accounts may generate in parallel. A single global gate would make user B
- * wait for user A even though their accounts are independent.
- */
-const gates = new Map()
-function gateFor(tokenHash) {
-  let perToken = gates.get(tokenHash)
-  if (!perToken) {
-    perToken = createRequestGate({
-      allowConcurrent: process.env.ALLOW_CONCURRENT === '1',
-      minIntervalMs: 0,
-      maxIntervalMs: 0,
-      longRunThreshold: 0,
-    })
-    gates.set(tokenHash, perToken)
-  }
-  return perToken
-}
+/** How many OTHER accounts a request may be moved to after its account turns out to be dead. */
+const POOL_RETRIES = Math.max(0, Number(process.env.POOL_RETRIES || 1))
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -136,24 +89,35 @@ async function readJsonBody(req, limitBytes = 64 * 1024 * 1024) {
   let size = 0
   for await (const chunk of req) {
     size += chunk.length
-    if (size > limitBytes) throw new Error(`request body exceeds ${limitBytes} bytes`)
+    if (size > limitBytes) throw Object.assign(new Error(`request body exceeds ${limitBytes} bytes`), { code: 'invalid_request' })
     chunks.push(chunk)
   }
   const text = Buffer.concat(chunks).toString('utf8')
   if (!text.trim()) return {}
-  return JSON.parse(text)
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    // A malformed body is the caller's mistake — 400, not a 500 from the server.
+    throw Object.assign(new Error(`invalid JSON body: ${error.message}`), { code: 'invalid_request' })
+  }
 }
 
 /** Internal error code -> HTTP response in OpenAI format. */
 function httpStatusFor(error) {
   const code = error?.code || error?.failure?.code
   if (code === 'AUTH' || code === 'MISSING_CREDENTIAL') return 401
-  if (code === 'RATE_LIMIT') return 429
-  if (code === 'TIMEOUT') return 504
+  if (code === 'RATE_LIMIT' || code === 'POOL_THROTTLED' || code === 'quota_exceeded') return 429
+  if (code === 'TIMEOUT' || code === 'POOL_TIMEOUT') return 504
   if (code === 'ABORTED') return 499
   if (code === 'TRANSPORT') return 502
   if (code === 'EMPTY_RESPONSE') return 503
   if (code === 'INVALID_SESSION') return 409
+  // The pool itself is unusable: nothing configured, or every token retired. That is a
+  // server-side problem, not the caller's — 503, so clients retry instead of giving up.
+  if (code === 'POOL_EMPTY' || code === 'POOL_EXHAUSTED') return 503
+  // A malformed body, an oversized one, or an empty `messages` array: the caller sent
+  // something wrong, so say 400 rather than letting it look like a server failure.
+  if (code === 'invalid_request') return 400
   // Exceeding the context is a CLIENT task error, not a server error — 400, so the client
   // knows it should shorten the history rather than retry.
   if (code === 'CONTEXT_WINDOW_EXCEEDED') return 400
@@ -174,34 +138,41 @@ function errorMessage(error) {
   return retry ? `${base} (retry after ~${Math.ceil(retry / 1000)}s)` : base
 }
 
+/** Account-wide request budget exceeded — the client's fault, and it must not mute DeepSeek. */
+function quotaError(quota) {
+  const retryAfterSec = Math.max(1, Math.ceil(quota.retryAfterMs / 1000))
+  return Object.assign(
+    new Error(`Quota exceeded: ${quota.limit} requests per window on this account. Retry in ~${retryAfterSec}s.`),
+    { code: 'quota_exceeded', providerRetryAfterMs: quota.retryAfterMs },
+  )
+}
+
 /**
- * Extracts the web session token from the request headers.
+ * Raw API key from the request (the `Bearer ` prefix already removed).
  *
- * The client's API key IS the chat.deepseek.com session token — there is no separate
- * API_KEY or token in .env. This way the server holds no secret and supports multiple
- * clients (each token = its own account and its own persistent session).
+ * The key IS the credential — there is no separate API_KEY in .env. `x-api-key` is
+ * accepted too, because several OpenAI clients send that header instead.
  */
-function tokenFromRequest(req) {
+function rawKeyFromRequest(req) {
   const header = String(req.headers.authorization || '')
   if (header.startsWith('Bearer ')) return header.slice(7).trim()
   if (header.startsWith('bearer ')) return header.slice(7).trim()
   return String(req.headers['x-api-key'] || '').trim()
 }
 
-/**
- * Builds the WebAuth for a request, or null when the token is missing.
- *
- * The cookie is optional and also comes from the request (`x-deepseek-cookie`) —
- * the token alone is enough, so normally nobody sends it.
- */
-function authFromRequest(req) {
-  const token = tokenFromRequest(req)
-  if (!token) return null
-  try {
-    return authFromToken(token, { cookie: String(req.headers['x-deepseek-cookie'] || '').trim() })
-  } catch {
-    return null
+/** Splits the key into individual DeepSeek tokens (Base64, so a comma is never inside one). */
+function tokensFromRequest(req) {
+  const raw = rawKeyFromRequest(req)
+  if (!raw) return []
+  const out = []
+  const seen = new Set()
+  for (const chunk of raw.split(',')) {
+    const token = chunk.trim()
+    if (!token || seen.has(token)) continue
+    seen.add(token)
+    out.push(token)
   }
+  return out
 }
 
 /** Model as seen by the client. */
@@ -242,50 +213,79 @@ function completionPayload({ id, created, text, thinking, toolCalls, finishReaso
   }
 }
 
+/** Drains a completion generator into a single reply. */
+async function collect(generator) {
+  let text = ''
+  let reasoning = ''
+  let finishReason = 'stop'
+  let usage
+  const toolCalls = []
+  for await (const event of generator) {
+    if (event.type === 'text') text += event.text
+    else if (event.type === 'thinking') reasoning += event.text
+    else if (event.type === 'tool_call') toolCalls.push(event)
+    else if (event.type === 'usage') usage = event.usage
+    else if (event.type === 'finish') finishReason = event.reason
+  }
+  return { text, reasoning, finishReason, usage, toolCalls }
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────
 
 async function handleModels(req, res) {
   sendJson(res, 200, { object: 'list', data: [modelObject()] })
 }
 
-async function handleHealth(req, res) {
-  // Without a token there is nothing to verify — /health is a public probe.
-  const reqAuth = authFromRequest(req)
-  if (!reqAuth) {
+/**
+ * Pool diagnostics. Public by design: it exposes counts and an 8-char fingerprint per
+ * token, never a credential. `?verify=1` forces a live re-check against DeepSeek.
+ */
+async function handleHealth(req, res, url) {
+  const tokens = tokensFromRequest(req)
+  if (tokens.length === 0) {
     sendJson(res, 200, {
       ok: true,
-      token: { valid: false, error: 'no token — pass it as the API key (Authorization: Bearer <token>)' },
-      session: { id: null },
+      auth: { required: true, source: 'comma-separated API key', hint: 'Authorization: Bearer tok1,tok2,tok3' },
+      pool: poolStatus([]),
       model: MODEL_ID,
       uptime_s: Math.round(process.uptime()),
+      data_dir: DATA_DIR,
     })
     return
   }
 
-  const tokenHash = tokenKey(reqAuth.token)
-  const who = await verifyToken(reqAuth).catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
-  let sessionId = currentSessionId(tokenHash)
-  if (who.ok && !sessionId) {
-    try {
-      sessionId = await ensureSession(reqAuth)
-    } catch {
-      /* a missing session is not a critical error — it will be created on the first request */
-    }
-  }
-  sendJson(res, who.ok ? 200 : 503, {
-    ok: who.ok,
-    token: who.ok ? { valid: true, account: who.user?.email || who.user?.mobile || who.user?.id } : { valid: false, error: who.error },
-    session: { id: sessionId ?? null },
-    access: { allowlist: accessControlEnabled, allowed: isTokenAllowed(tokenHash) },
-    quota: quotaStatus(tokenHash),
-    rate_limit: cooldownStatus(tokenHash),
+  // Verifying always matches the previous behaviour (a bad key reports 503). It costs one
+  // read-only request per token; `?verify=0` skips it and reports the cached state.
+  const verify = url?.searchParams.get('verify') !== '0'
+  const status = verify
+    ? await verifyPool(tokens).catch(() => poolStatus(tokens))
+    : poolStatus(tokens)
+
+  sendJson(res, status.usable > 0 ? 200 : 503, {
+    ok: status.usable > 0,
+    auth: { required: true, source: 'comma-separated API key', tokens_in_key: tokens.length },
+    pool: status,
     model: MODEL_ID,
     uptime_s: Math.round(process.uptime()),
+    data_dir: DATA_DIR,
   })
 }
 
-/** Builds an OpenAI-format SSE listing and streams the deltas. */
-async function handleChatCompletions(req, res, body) {
+/** A generation bound to one pool account. */
+function startCompletion(lease, { body, messages, thinking, search, signal }) {
+  return runChatCompletion({
+    auth: lease.auth,
+    getSession: async (forceNew) => ensureSession(lease.auth, { forceNew, signal }),
+    messages,
+    tools: body?.tools,
+    toolChoice: body?.tool_choice,
+    thinking,
+    search,
+    signal,
+  })
+}
+
+async function handleChatCompletions(req, res, body, setPoolEntry) {
   const stream = body?.stream === true
   const messages = Array.isArray(body?.messages) ? body.messages : []
   if (messages.length === 0) {
@@ -293,43 +293,24 @@ async function handleChatCompletions(req, res, body) {
     return
   }
 
-  const reqAuth = authFromRequest(req)
-  if (!reqAuth) {
-    sendError(res, 401, 'Missing API key — pass your chat.deepseek.com session token as the API key', {
+  const tokens = tokensFromRequest(req)
+  if (tokens.length === 0) {
+    sendError(res, 401, 'Missing API key — send your chat.deepseek.com session token(s) as the API key', {
       type: 'authentication_error',
       code: 'invalid_api_key',
     })
     return
   }
 
-  const reqTokenHash = tokenKey(reqAuth.token)
-  if (!isTokenAllowed(reqTokenHash)) {
-    sendError(res, 403, 'This token is not on the access allowlist (ACCESS_ALLOWLIST).', {
+  // The allowlist (when enabled) is checked PER TOKEN: a key may list several accounts and
+  // only some of them may be on the list. An empty result means the caller may not use any
+  // of the accounts they presented.
+  const allowed = tokens.filter((token) => isTokenAllowed(tokenKey(token)))
+  if (allowed.length === 0) {
+    sendError(res, 403, 'None of the tokens in this API key are on the access allowlist (ACCESS_ALLOWLIST).', {
       type: 'authentication_error',
       code: 'access_denied',
     })
-    return
-  }
-  const quota = consumeQuota(reqTokenHash)
-  if (!quota.allowed) {
-    const retryAfterSec = Math.ceil(quota.retryAfterMs / 1000)
-    sendError(res, 429, `Quota exceeded: ${quota.limit} requests per window. Retry in ~${retryAfterSec}s.`, {
-      type: 'rate_limit_error',
-      code: 'quota_exceeded',
-    }, { 'retry-after': String(retryAfterSec) })
-    return
-  }
-
-  // DeepSeek rate-limit cooldown (see ratelimit.mjs). While muted, the request is answered
-  // locally with 429 + `retry-after` and NEVER reaches DeepSeek — contacting it would reset
-  // the provider's window and keep the account throttled indefinitely.
-  const cooldownMs = mutedFor(reqTokenHash)
-  if (cooldownMs > 0) {
-    const retryAfterSec = Math.max(1, Math.ceil(cooldownMs / 1000))
-    sendError(res, 429, `DeepSeek rate limit active. The account is paused; retry in ~${retryAfterSec}s.`, {
-      type: 'rate_limit_error',
-      code: 'rate_limit_cooldown',
-    }, { 'retry-after': String(retryAfterSec) })
     return
   }
 
@@ -349,109 +330,124 @@ async function handleChatCompletions(req, res, body) {
   const thinking = body?.reasoning_effort === 'none' || body?.thinking === false || body?.reasoning === false
     ? false
     : true
+  const search = body?.web_search === true
 
-  // One "acquire" for the whole HTTP request: covers all auto-continue rounds and uploads.
-  // This way two requests from this server never generate at the same time.
-  let release
-  try {
-    release = await gateFor(reqTokenHash).acquire('chat', controller.signal)
-  } catch (error) {
-    if (controller.signal.aborted) return
-    throw error
-  }
-
-  const generator = runChatCompletion({
-    auth: reqAuth,
-    getSession: async (forceNew) => ensureSession(reqAuth, { forceNew, signal: controller.signal }),
-    messages,
-    tools: body?.tools,
-    toolChoice: body?.tool_choice,
-    thinking,
-    search: body?.web_search === true,
-    signal: controller.signal,
-  })
-
+  // ── Non-streaming: nothing has been sent yet, so a dead account can be swapped out ──
   if (!stream) {
-    let text = ''
-    let reasoning = ''
-    let finishReason = 'stop'
-    let usage
-    const toolCalls = []
-    try {
-      for await (const event of generator) {
-        if (event.type === 'text') text += event.text
-        else if (event.type === 'thinking') reasoning += event.text
-        else if (event.type === 'tool_call') toolCalls.push(event)
-        else if (event.type === 'usage') usage = event.usage
-        else if (event.type === 'finish') finishReason = event.reason
+    for (let attempt = 0; ; attempt++) {
+      let lease
+      try {
+        lease = await acquireToken(allowed, { signal: controller.signal })
+        setPoolEntry(lease.entry)
+        const quota = consumeQuota(lease.entry.hash)
+        if (!quota.allowed) throw quotaError(quota)
+
+        const reply = await collect(startCompletion(lease, { body, messages, thinking, search, signal: controller.signal }))
+        reportOutcome(lease.entry, null)
+        sendJson(res, 200, completionPayload({
+          id, created, model,
+          text: reply.text,
+          thinking: reply.reasoning,
+          toolCalls: reply.toolCalls,
+          finishReason: reply.finishReason,
+          usage: reply.usage,
+        }))
+        return
+      } catch (error) {
+        reportOutcome(lease?.entry, error)
+        // Only a RETIRED account is worth another try — and only if one is left to try.
+        if (!lease || lease.entry.state !== 'dead' || attempt >= POOL_RETRIES) throw error
+        log.warn('account rejected — retrying on another one', {
+          id,
+          account_index: lease.entry.index,
+          attempt: attempt + 1,
+        })
+      } finally {
+        lease?.release()
       }
-    } finally {
-      release?.()
     }
-    sendJson(res, 200, completionPayload({ id, created, text, thinking: reasoning, toolCalls, finishReason, usage, model }))
-    return
   }
 
   // ── Streaming ─────────────────────────────────────────────────────────
-  res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-transform',
-    connection: 'keep-alive',
-    'x-accel-buffering': 'no',
-  })
-
-  const base = { id, object: 'chat.completion.chunk', created, model }
-  const write = (payload) => {
-    if (res.writableEnded) return
-    res.write(`data: ${JSON.stringify(payload)}\n\n`)
-  }
-  const chunk = (delta, finishReason = null) => ({ ...base, choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }] })
-
-  // First delta with the role + heartbeat, so clients do not consider the connection dead.
-  write(chunk({ role: 'assistant', content: '' }))
-  const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(': keep-alive\n\n')
-  }, 15_000)
-  heartbeat.unref?.()
-
-  let toolIndex = 0
-  let finishReason = 'stop'
-  let usage
-
+  // The account must be settled BEFORE the SSE head goes out: once the status line is on
+  // the wire an error can no longer become an HTTP error, it has to be an SSE event.
+  const lease = await acquireToken(allowed, { signal: controller.signal })
+  setPoolEntry(lease.entry)
   try {
-    for await (const event of generator) {
-      if (event.type === 'text') {
-        write(chunk({ content: event.text }))
-      } else if (event.type === 'thinking') {
-        write(chunk({ reasoning_content: event.text }))
-      } else if (event.type === 'tool_call') {
-        const index = toolIndex++
-        write(chunk({ tool_calls: [{ index, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] }))
-        // Arguments go as a separate delta — that is what OpenAI does too.
-        write(chunk({ tool_calls: [{ index, function: { arguments: event.arguments } }] }))
-      } else if (event.type === 'usage') {
-        usage = event.usage
-      } else if (event.type === 'finish') {
-        finishReason = event.reason
+    const quota = consumeQuota(lease.entry.hash)
+    if (!quota.allowed) throw quotaError(quota)
+
+    const generator = startCompletion(lease, { body, messages, thinking, search, signal: controller.signal })
+
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    })
+
+    const base = { id, object: 'chat.completion.chunk', created, model }
+    const write = (payload) => {
+      if (res.writableEnded) return
+      res.write(`data: ${JSON.stringify(payload)}\n\n`)
+    }
+    const chunk = (delta, finishReason = null) => ({ ...base, choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }] })
+
+    // First delta with the role + heartbeat, so clients do not consider the connection dead.
+    write(chunk({ role: 'assistant', content: '' }))
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) res.write(': keep-alive\n\n')
+    }, 15_000)
+    heartbeat.unref?.()
+
+    let toolIndex = 0
+    let finishReason = 'stop'
+    let usage
+
+    try {
+      for await (const event of generator) {
+        if (event.type === 'text') {
+          write(chunk({ content: event.text }))
+        } else if (event.type === 'thinking') {
+          write(chunk({ reasoning_content: event.text }))
+        } else if (event.type === 'tool_call') {
+          const index = toolIndex++
+          write(chunk({ tool_calls: [{ index, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] }))
+          // Arguments go as a separate delta — that is what OpenAI does too.
+          write(chunk({ tool_calls: [{ index, function: { arguments: event.arguments } }] }))
+        } else if (event.type === 'usage') {
+          usage = event.usage
+        } else if (event.type === 'finish') {
+          finishReason = event.reason
+        }
       }
+      write(chunk({}, finishReason))
+      write({ ...base, choices: [], usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })
+      reportOutcome(lease.entry, null)
+    } catch (error) {
+      reportOutcome(lease.entry, error)
+      const status = httpStatusFor(error)
+      // A provider 429 during streaming must ALSO start the account cooldown — the HTTP status
+      // is already sent, so this path bypasses the global handler in the router.
+      if ((error?.code ?? error?.failure?.code) === 'RATE_LIMIT') {
+        const retryAfterMs = error?.failure?.providerRetryAfterMs ?? error?.providerRetryAfterMs
+        const muted = muteToken(lease.entry.hash, retryAfterMs)
+        log.warn('rate limit cooldown started', { id, token: lease.entry.prefix, cooldown_ms: Math.round(muted) })
+      }
+      // The stream has already started — the HTTP code cannot change. Send the error as an event.
+      write({ error: { message: errorMessage(error), type: openAiErrorType(status), code: error?.code ?? error?.failure?.code ?? 'provider_error' } })
+    } finally {
+      clearInterval(heartbeat)
     }
-    write(chunk({}, finishReason))
-    write({ ...base, choices: [], usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })
   } catch (error) {
-    const status = httpStatusFor(error)
-    // A provider 429 during streaming must ALSO start the account cooldown — the HTTP status
-    // is already sent, so this path bypasses the global handler in the router.
-    if ((error?.code ?? error?.failure?.code) === 'RATE_LIMIT') {
-      const retryAfterMs = error?.failure?.providerRetryAfterMs ?? error?.providerRetryAfterMs
-      const muted = muteToken(reqTokenHash, retryAfterMs)
-      log.warn('rate limit cooldown started', { id, token: tokenPrefix(reqAuth.token), cooldown_ms: Math.round(muted) })
-    }
-    // The stream has already started — the HTTP code cannot change. Send the error as an event.
-    write({ error: { message: errorMessage(error), type: openAiErrorType(status), code: error?.code ?? error?.failure?.code ?? 'provider_error' } })
+    // Nothing was streamed yet, so the router can still turn this into a proper HTTP error.
+    if (!res.headersSent) throw error
+    log.error('stream failed after the response had started', { id, message: errorMessage(error) })
   } finally {
-    clearInterval(heartbeat)
-    release?.()
-    if (!res.writableEnded) {
+    lease.release()
+    // Only close an SSE response we actually opened — a pre-stream failure (quota, pool
+    // error) must be left alone so the router can reply with a real HTTP status.
+    if (res.headersSent && !res.writableEnded) {
       res.write('data: [DONE]\n\n')
       res.end()
     }
@@ -470,6 +466,9 @@ const server = createServer(async (req, res) => {
   const requestId = randomUUID().slice(0, 12)
   const method = req.method || 'GET'
   let path = '/'
+  /** Which pool entry served the request — set once one is acquired, for the log line. */
+  let poolEntry = null
+  const setPoolEntry = (entry) => { poolEntry = entry }
 
   // Every response carries the request id, so a client report can be matched to a log line.
   res.setHeader('x-request-id', requestId)
@@ -483,7 +482,8 @@ const server = createServer(async (req, res) => {
       status,
       ms: Date.now() - started,
       ip: clientIp(req),
-      token: tokenPrefix(tokenFromRequest(req)),
+      token: tokenPrefix(rawKeyFromRequest(req).split(',')[0]),
+      account_index: poolEntry?.index,
     })
   })
 
@@ -503,7 +503,17 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === 'GET' && (path === '/health' || path === '/v1/health')) {
-      await handleHealth(req, res)
+      await handleHealth(req, res, url)
+      return
+    }
+    if (method === 'GET' && (path === '/tokens' || path === '/v1/tokens')) {
+      const tokens = tokensFromRequest(req)
+      sendJson(res, 200, { object: 'list', ...poolStatus(tokens) })
+      return
+    }
+    if (method === 'POST' && (path === '/tokens/revive' || path === '/v1/tokens/revive')) {
+      const tokens = tokensFromRequest(req)
+      sendJson(res, 200, { object: 'list', ...(await reviveTokens(tokens)) })
       return
     }
     if (method === 'GET' && (path === '/v1/models' || path === '/models')) {
@@ -512,7 +522,7 @@ const server = createServer(async (req, res) => {
     }
     if (method === 'POST' && (path === '/v1/chat/completions' || path === '/chat/completions')) {
       const body = await readJsonBody(req)
-      await handleChatCompletions(req, res, body)
+      await handleChatCompletions(req, res, body, setPoolEntry)
       return
     }
     sendError(res, 404, `Unknown route: ${method} ${path}`, { code: 'not_found' })
@@ -541,11 +551,11 @@ const server = createServer(async (req, res) => {
     // A provider 429 starts the account cooldown: subsequent requests are answered locally
     // (see ratelimit.mjs) so DeepSeek's throttle window can actually expire. `quota_exceeded`
     // is OUR limit and must not mute the provider account.
-    if (status === 429 && (error?.code ?? error?.failure?.code) === 'RATE_LIMIT') {
-      const muted = muteToken(tokenKey(tokenFromRequest(req)), retryAfterMs)
+    if (status === 429 && (error?.code ?? error?.failure?.code) === 'RATE_LIMIT' && poolEntry) {
+      const muted = muteToken(poolEntry.hash, retryAfterMs)
       log.warn('rate limit cooldown started', {
         id: requestId,
-        token: tokenPrefix(tokenFromRequest(req)),
+        token: poolEntry.prefix,
         cooldown_ms: Math.round(muted),
       })
     }

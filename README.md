@@ -40,8 +40,8 @@ npm start           # if you have npm
 node src/server.mjs # or directly
 ```
 
-The server listens on `http://127.0.0.1:8787`. Pass the `chat.deepseek.com` session
-token as the API key:
+The server listens on `http://127.0.0.1:8787`. Pass your `chat.deepseek.com` session
+token(s) as the API key:
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -52,6 +52,68 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 Environment variables are optional — every one has a working default. Want to change
 them? Copy `.env.example` to `.env` and edit.
+
+## API key and token format
+
+The API key **is** a `chat.deepseek.com` session token (or a comma-separated list of
+them). There is no separate key in `.env`, so the server holds no secret.
+
+### Where to get a token
+
+1. Log in at <https://chat.deepseek.com>.
+2. Open DevTools → Network, click any request to `api.deepseek.com`.
+3. Copy the `Authorization` request header — the value after `Bearer ` is the token.
+
+A token is a full account credential. Treat it like a password; do not commit it or share
+it.
+
+### Format
+
+```
+Authorization: Bearer <token>
+```
+
+| Key | Accounts used |
+|---|---|
+| `tok1` | one |
+| `tok1,tok2,tok3` | three |
+| `tok1, tok1` | one (duplicates are dropped) |
+
+A session token is Base64 — letters, digits, `+`, `/`, and sometimes `=`. A comma never
+occurs inside one, so the split is unambiguous: `tok1,tok2,tok3` is three accounts, not
+one malformed key. Whitespace around entries is trimmed. `x-api-key: <tokens>` is
+accepted as an alternative to the `Authorization` header.
+
+### Why list several tokens
+
+DeepSeek's web endpoint allows only **one generation per account at a time**. With one
+token every request from every client serialises behind that account. With several, the
+pool spreads requests across the accounts:
+
+- the **least-used** usable account serves the next request,
+- an account is held for the whole HTTP request and released at the end,
+- if every account is busy the request queues, and it is aborted when the client goes away,
+- an account in a 429 cooldown is skipped — if none are free, the caller gets `429` with
+  `retry-after` instead of hanging,
+- a token DeepSeek rejects (`AUTH`) is marked dead and dropped from rotation,
+- each token is verified once on first use, so an expired entry fails fast on that account
+  instead of poisoning every request.
+
+Sessions, rate-limit cooldowns and quotas are keyed by the **individual** token digest, so
+two accounts listed in one key never collide. A single token with no comma behaves exactly
+as before.
+
+Check the state of the accounts in a key:
+
+```bash
+curl http://127.0.0.1:8787/health \
+  -H "Authorization: Bearer tok1,tok2,tok3"
+```
+
+`/health` reports `configured`, `usable`, `dead`, `muted` and one entry per token (8-char
+fingerprint, account, request counts, cooldown, session id) — never the token itself.
+`?verify=0` skips the live re-check; `POST /tokens/revive` clears the dead flag and
+verifies again.
 
 ## How it works
 
@@ -164,21 +226,19 @@ after ~40 turns.
 |---|---|---|
 | GET | `/v1/models` | Model list (one entry) |
 | POST | `/v1/chat/completions` | Chat; `stream: true` and `false` |
-| GET | `/health` | Token state, persistent session, access control and quota |
+| GET | `/health` | Token-pool state (`?verify=0` skips the live check) |
+| GET | `/tokens` | Token-pool state as JSON |
+| POST | `/tokens/revive` | Clear the dead flag and verify the key's tokens again |
 
-Aliases without `/v1` (`/models`, `/chat/completions`) also work.
+Aliases without `/v1` (`/models`, `/chat/completions`, `/tokens`) also work.
 
-### Multiple users
+### Access control, quotas and state
 
-Every client supplies its own DeepSeek token, and state (session, gate) is keyed by the
-token digest — two accounts do not collide and cannot see each other's sessions.
-
-**Concurrency.** The gate is **per token**, not global: requests with the same token are
-serialized (the web allows one generation per account), but different accounts generate
-**in parallel**. Previously a single global gate blocked everyone.
+See [API key and token format](#api-key-and-token-format) for how a key maps to accounts.
 
 **Access control** (`ACCESS_ALLOWLIST`, disabled by default) — a list of allowed tokens as
-sha256 digests. Without it, any valid token passes.
+sha256 digests. Without it, any valid token passes. Checked **per token**: a key may list
+several accounts and only some of them may be allowed.
 
 **Quotas** (`QUOTA_MAX_REQUESTS`, `QUOTA_WINDOW_MS`, disabled by default) — a per-token
 request limit within a time window; exceeding it returns `429` with a `retry-after` header.
@@ -218,10 +278,12 @@ non-stream, stream, one session, image, file, tools.
 | `src/server.mjs` | HTTP server, routing, OpenAI SSE format |
 | `src/openai.mjs` | OpenAI ↔ DeepSeek mapping (prompt, attachments, tools) |
 | `src/deepseek.mjs` | Web API client (PoW, sessions, upload, streaming) |
-| `src/session.mjs` | Persistent "API" session + state persistence + cleanup (TTL, entry cap) |
+| `src/session.mjs` | Persistent session + state persistence + cleanup (TTL, entry cap) |
+| `src/pool.mjs` | Per-request token pool (comma-separated key, account selection, dead-token eviction) |
 | `src/access.mjs` | Access control (allowlist) and per-token quotas |
+| `src/env.mjs` | Minimal `.env` loader, imported first so every module sees the environment |
 | `src/log.mjs` | Structured logs (JSON), request id, IP behind a proxy |
-| `src/webapi.ts`, `src/protocol.ts`, `src/auth.ts`, `src/gate.ts` | Battle-tested core from the `dsh-deepseek-web-login` plugin (PoW WASM, SSE parser, tool protocol, throttling) |
+| `src/webapi.ts`, `src/protocol.ts`, `src/auth.ts`, `src/gate.ts` | Battle-tested core (PoW WASM, SSE parser, tool protocol, throttling) |
 
 The `.ts` files are used directly — Node 22.6+ strips types natively. There is no build
 step and no `node_modules` dependency.
@@ -232,19 +294,14 @@ The full list with descriptions is in `.env.example`. The most important: `PORT`
 `MAX_PROMPT_CHARS` (default 1 000 000 characters).
 
 The session token is NOT an environment variable — the client passes it as
-`Authorization: Bearer <token>` (the API key). This way the server stores no secret and
-every client can use their own DeepSeek account.
+`Authorization: Bearer <token>` (the API key), optionally several tokens separated by
+commas. This way the server stores no secret and every client can use their own DeepSeek
+account(s).
 
 ## License
 
 **MIT** — see [LICENSE](LICENSE). You may use, modify and host this code, including
 commercially; the only condition is to keep the authorship notice.
-
-The `.ts` core (`webapi.ts`, `protocol.ts`, `auth.ts`, `gate.ts`, `accounts.ts`,
-`cookies.ts`, `paths.ts`) is vendored from the `dsh-deepseek-web-login` plugin and is
-licensed under **Apache-2.0** (see [LICENSE-APACHE](LICENSE-APACHE) and [NOTICE](NOTICE)).
-Apache-2.0 is permissive, so the whole may be distributed under MIT — the original Apache
-terms remain in force for those files, and the authorship notice is kept in `NOTICE`.
 
 ## Disclaimer
 

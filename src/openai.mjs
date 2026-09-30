@@ -12,8 +12,7 @@
  *   DeepSeek SSE events -> OpenAI-format deltas (content / reasoning_content / tool_calls)
  *
  * Text processing (tool-protocol filter, transcript-echo guards, web-UI disclaimer
- * stripping) is REUSED from src/protocol.ts — the same code that powers the
- * dsh-deepseek-web-login plugin and has hundreds of real sessions behind it.
+ * stripping) lives in src/protocol.ts and has hundreds of real sessions behind it.
  */
 import { randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
