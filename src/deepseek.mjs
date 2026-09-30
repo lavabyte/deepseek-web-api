@@ -53,7 +53,7 @@ export function authFromToken(token, extra = {}) {
   }
 }
 
-/** POST JSON na endpoint webowy; zwraca {status, text, json}. */
+/** POST JSON to a web endpoint; returns {status, text, json}. */
 async function postJson(auth, path, body, signal) {
   let resp
   try {
@@ -91,7 +91,7 @@ function looksLikeHtml(text) {
   return /^\s*<!doctype html|^\s*<html/i.test(String(text || ''))
 }
 
-// ── Sesje ───────────────────────────────────────────────────────────────
+// ── Sessions ───────────────────────────────────────────────────────────────
 
 /** Creates a new chat session. Returns chat_session_id. */
 export async function newChatSession(auth, signal) {
@@ -136,13 +136,13 @@ export async function deleteChatSession(auth, sessionId) {
 
 
 
-// ── Pliki / obrazy ──────────────────────────────────────────────────────
+// ── Files / images ──────────────────────────────────────────────────────
 
 const FILE_READY = new Set(['SUCCESS', 'READY', 'PARSED', 'FINISHED'])
 const FILE_FAILED = new Set(['FAILED', 'ERROR', 'BLOCKED', 'REJECTED'])
 
 /**
- * Wgrywa plik (obraz lub dokument) i zwraca {fileId, status, modelKind, isImage}.
+ * Uploads a file (image or document) and returns {fileId, status, modelKind, isImage}.
  *
  * NOTE: the returned file is usually in PENDING status — it is only usable in
  * `ref_file_ids` after waitForFile(). For a ready id, use uploadFileReady().
@@ -171,11 +171,11 @@ export async function uploadFile(auth, { data, mediaType, name }, signal) {
   }
   const biz = envelopeError(json)
   if (biz) {
-    // UWAGA (zmierzone na zywym koncie): DeepSeek ogranicza SAME uploady osobno od
-    // generation. Code 7 = "rate limit reached" (also mute/busy) — if we classified
-    // to jako PROVIDER_ERROR, uploadAttachments uzna zalacznik za trwale zepsuty i pominie
-    // obraz/plik, choc wystarczyloby odczekac. Dlatego kazdy wariant throttlingu -> RATE_LIMIT,
-    // zeby warstwa wyzej mogla ponowic.
+    // NOTE (measured on a live account): DeepSeek rate-limits UPLOADS separately from
+    // generation. Code 7 = "rate limit reached" (also mute/busy) — if we classified it as
+    // PROVIDER_ERROR, uploadAttachments would treat the attachment as permanently broken and
+    // skip the image/file even though waiting would have been enough. So every throttling
+    // variant maps to RATE_LIMIT, letting the layer above retry.
     const throttled = biz.code === 5 || biz.code === 7 || isThrottled(biz.msg) || isMutedError(biz) || isBusyGenerating(biz.msg)
     throw new AdapterLlmError(
       `DeepSeek upload rejected (code ${biz.code}): ${biz.msg}`,
@@ -189,7 +189,7 @@ export async function uploadFile(auth, { data, mediaType, name }, signal) {
   return { fileId, status: file.status, modelKind: file.model_kind, isImage: file.is_image === true, name: file.file_name }
 }
 
-/** Odczytuje status pliku (GET fetch_files?file_ids=...). */
+/** Reads a file status (GET fetch_files?file_ids=...). */
 export async function fileStatus(auth, fileId, signal) {
   const r = await getJson(auth, `/api/v0/file/fetch_files?file_ids=${encodeURIComponent(fileId)}`, signal)
   const files = r.json?.data?.biz_data?.files
@@ -266,7 +266,7 @@ function envelopeFailure(json, status) {
     return {
       status: 409,
       code: 'invalid_session',
-      message: `Sesja webowa DeepSeeka osiagnela limit wiadomosci (${biz.msg}) — odtwarzam ja.`,
+      message: `The DeepSeek web session reached its message limit (${biz.msg}) — recreating it.`,
     }
   }
   if (isContextLimitError(biz.msg)) {

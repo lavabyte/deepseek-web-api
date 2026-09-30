@@ -1336,7 +1336,7 @@ export class ToolCallStreamFilter {
   /** Markdown code context carried across released chunks (see `advanceMarkdownState`). */
   private markdown: MarkdownCodeState = initialMarkdownState()
   /**
-   * Czy w tej rundzie wyemitowano juz co najmniej jeden **poprawny** tool_call.
+   * Whether this round has already emitted at least one **valid** tool_call.
    *
    * WARNING: user-measured 2026-09-14: the model emits one complete, correct call, then starts a
    * second one and the stream is cut in the middle of it. The old logic classified that tail as
@@ -1395,7 +1395,7 @@ export class ToolCallStreamFilter {
       // WARNING: user-measured: the model often emits a COMPLETE body of text with a broken
       // protocol fragment at the end (e.g. a stray `{` after the answer, or a truncated second
       // call). The old logic classified the whole buffer as `unbalanced` -> the round was
-      // discarded and retried, and the user saw 'response od ai zwykle wtedy jest poprawny'.
+      // discarded and retried, even though the model's reply was usually valid.
       // The handling now has two steps:
       //   a) emit the already-balanced PREFIX of the buffer as body text (that is the model's
       //      real answer);
