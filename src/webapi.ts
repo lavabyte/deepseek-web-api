@@ -512,22 +512,29 @@ async function requestPowHeader(auth: WebAuth, targetPath: string, signal?: Abor
 }
 
 /**
- * PoW challenge z ponowieniami.
- *
  * PoW challenge with retries.
  *
  * WARNING: 2026-09-18 (user report: repeated "DeepSeek PoW challenge returned non-JSON"):
  * the challenge endpoint can return HTTP 200 with a body that is not JSON (an anti-bot page,
  * an empty body, a truncated response). The old version then threw `MALFORMED_RESPONSE`,
- * which no layer retried -> the whole chat round failed hard. The challenge is cheap and
- * side-effect free, so it is retried with a short backoff; once attempts are exhausted the
- * error propagates.
+ * which no layer retried -> the whole chat round failed hard.
+ *
+ * 2026-10-02 (user report: "returned non-JSON (empty body)" still appears occasionally):
+ * the endpoint intermittently answers 200 with a COMPLETELY EMPTY body. That is an edge /
+ * gateway hiccup, not a client error, and four closely-spaced attempts could all land
+ * inside the same blip. The ladder is therefore longer, backs off further, and is jittered
+ * so parallel requests do not retry in lockstep against the same unhealthy edge node.
+ *
+ * The challenge is cheap and side-effect free, so retrying is safe; once attempts are
+ * exhausted the error propagates.
  *
  * Only non-transient errors are NOT retried (e.g. `AUTH` from HTTP 401/403 -- an expired
  * session needs a new token, not another attempt).
  */
 export async function createPowHeader(auth: WebAuth, targetPath: string, signal?: AbortSignal): Promise<string> {
-  const BACKOFF_MS = [500, 1_500, 3_000]
+  // ~15 s total across 8 attempts: enough to ride out an edge-node blip, short enough that
+  // a genuinely broken endpoint still fails while the caller is watching.
+  const BACKOFF_MS = [250, 500, 1_000, 2_000, 3_000, 4_000, 5_000]
   let lastError: unknown
   for (let attempt = 0; attempt <= BACKOFF_MS.length; attempt += 1) {
     try {
@@ -537,10 +544,12 @@ export async function createPowHeader(auth: WebAuth, targetPath: string, signal?
       const retryable = code === 'TRANSPORT' || code === 'MALFORMED_RESPONSE'
       if (!retryable || attempt === BACKOFF_MS.length || signal?.aborted) throw error
       lastError = error
+      // Jitter (0-250 ms) so concurrent requests do not hammer the same edge node in step.
+      const waitMs = BACKOFF_MS[attempt] + Math.floor(Math.random() * 250)
       // NOTE: deliberately NOT unref'd. The retry delay is part of the operation, so it
       // must keep the event loop alive — an unref'd timer can be skipped when the process
       // is otherwise idle, which made a standalone call hang (observed 2026-09-18).
-      await new Promise<void>((resolve) => setTimeout(resolve, BACKOFF_MS[attempt]))
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs))
     }
   }
   throw lastError

@@ -27,7 +27,7 @@ import {
   renderToolCallsDsml,
 } from './protocol.ts'
 import { AdapterLlmError } from './auth.ts'
-import { streamCompletion, continueChatStream, uploadFileReady } from './deepseek.mjs'
+import { streamCompletion, uploadFileReady } from './deepseek.mjs'
 import { DEFAULT_COOLDOWN_MS } from './ratelimit.mjs'
 
 /**
@@ -559,10 +559,18 @@ export async function* runChatCompletion(options) {
   let toolCallCount = 0
   let completed = false
   /**
-   * Response message id of the round we are currently generating, captured from the `meta`
-   * SSE event. It is what `/chat/continue` needs to resume the SAME message server-side.
+   * NOTE: the native server-side resume (`POST /api/v0/chat/continue`) was REMOVED on
+   * 2026-09-30. DeepSeek's PoW challenge is bound to the target path, and the challenge
+   * endpoint now rejects that path outright:
+   *
+   *     POST /api/v0/chat/create_pow_challenge {"target_path":"/api/v0/chat/continue"}
+   *     -> {"code":0,"data":{"biz_code":1,"biz_msg":"INVALID_TARGET_PATH"}}
+   *
+   * (`/chat/completion`, `/chat/regenerate` and `/file/upload_file` are still accepted.)
+   * The failure only surfaced on round 2 of a long reply — i.e. exactly when a reply was
+   * cut and the code tried to resume it — which is why it looked like a rare, late error.
+   * Auto-continue now always uses the prompt-hack path below, which still works.
    */
-  let resumeMessageId
   /**
    * NO retry ladder on 429.
    *
@@ -610,34 +618,25 @@ export async function* runChatCompletion(options) {
      */
     let cutAfterTools = false
 
-    // Round 0 starts a new message; later rounds prefer the NATIVE server-side resume
-    // (`/chat/continue`), which carries on the exact same assistant message instead of
-    // re-sending the whole prompt with a "continue" instruction. The prompt-hack remains
-    // as a fallback for when no response message id was captured.
-    const useNativeResume = rounds > 0 && resumeMessageId !== undefined
+    // Every round (including auto-continue) goes through `/chat/completion` with the
+    // rebuilt prompt. The native `/chat/continue` resume was removed on 2026-09-30: the
+    // PoW challenge endpoint rejects that target path (see the note above).
 
     // Stream open: one retry when the stored session expired on the web side.
     let iterator
     let probe
     for (let attempt = 0; ; attempt += 1) {
       const sessionId = await getSession(attempt > 0)
-      const it = useNativeResume
-        ? continueChatStream(auth, {
-            sessionId,
-            messageId: resumeMessageId,
-            signal,
-            idleTimeoutMs,
-          })[Symbol.asyncIterator]()
-        : streamCompletion(auth, {
-            sessionId,
-            prompt,
-            refFileIds: rounds === 0 ? refFileIds : [],
-            thinkingEnabled: thinking,
-            searchEnabled: search,
-            modelType: 'default',
-            signal,
-            idleTimeoutMs,
-          })[Symbol.asyncIterator]()
+      const it = streamCompletion(auth, {
+        sessionId,
+        prompt,
+        refFileIds: rounds === 0 ? refFileIds : [],
+        thinkingEnabled: thinking,
+        searchEnabled: search,
+        modelType: 'default',
+        signal,
+        idleTimeoutMs,
+      })[Symbol.asyncIterator]()
       try {
         probe = await it.next()
       } catch (error) {
@@ -655,12 +654,9 @@ export async function* runChatCompletion(options) {
         if (next.done) break
         const event = next.value
 
-        // Response message id of this round — used to resume the SAME message natively
-        // (`/chat/continue`) if the web cuts the stream before it finishes.
-        if (event.kind === 'meta') {
-          resumeMessageId = event.messageId
-          continue
-        }
+        // `meta` events carry the response message id; nothing consumes it any more
+        // (native resume was removed), so they are simply skipped.
+        if (event.kind === 'meta') continue
 
         if (event.kind === 'thinking') {
           thinkingSoFar += event.text

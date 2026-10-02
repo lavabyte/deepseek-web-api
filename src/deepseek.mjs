@@ -456,29 +456,17 @@ export async function* streamCompletion(auth, params) {
 }
 
 /**
- * Resumes generation of an existing assistant message (`/chat/continue`).
+ * NOTE (2026-09-30): `continueChatStream` (`POST /api/v0/chat/continue`) was REMOVED.
  *
- * This is the NATIVE server-side continuation: instead of rebuilding the prompt with the
- * partial reply plus a "continue" instruction, we ask DeepSeek to carry on the SAME
- * message. `message_id` is the response message id captured from the `meta` event.
+ * The PoW challenge is bound to the target path, and DeepSeek's challenge endpoint now
+ * rejects that path outright:
  *
- * Payload (verified): {chat_session_id, message_id, fallback_to_resume: true}.
+ *     POST /api/v0/chat/create_pow_challenge {"target_path":"/api/v0/chat/continue"}
+ *     -> {"code":0,"data":{"biz_code":1,"biz_msg":"INVALID_TARGET_PATH"}}
+ *
+ * (`/chat/completion`, `/chat/regenerate` and `/file/upload_file` are still accepted.)
+ * Auto-continue therefore always rebuilds the prompt and goes through `/chat/completion`.
  */
-export async function* continueChatStream(auth, params) {
-  const { sessionId, messageId, signal, idleTimeoutMs = 120_000 } = params
-
-  yield* readChatStream(auth, {
-    sessionId,
-    path: '/api/v0/chat/continue',
-    body: {
-      chat_session_id: sessionId,
-      message_id: messageId,
-      fallback_to_resume: true,
-    },
-    signal,
-    idleTimeoutMs,
-  })
-}
 
 /**
  * Collects the whole stream into {text, thinking, finish, events}.
