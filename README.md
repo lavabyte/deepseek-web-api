@@ -1,4 +1,4 @@
-# deepseek-web-api
+# DeepSeek Web API
 
 ### Notice
 This entire project was vide-coded with DeepSeek V4.1 Flash
@@ -61,11 +61,37 @@ them). There is no separate key in `.env`, so the server holds no secret.
 ### Where to get a token
 
 1. Log in at <https://chat.deepseek.com>.
-2. Open DevTools → Network, click any request to `api.deepseek.com`.
-3. Copy the `Authorization` request header — the value after `Bearer ` is the token.
+2. Open DevTools (**F12**) → **Application** → **Local Storage** →
+   `https://chat.deepseek.com`.
+3. Find the **`userToken`** entry. Its value is a JSON object:
+
+   ```json
+   {
+       "value": "<token>",
+       "__version": "0"
+   }
+   ```
+
+4. Right-click the entry → **Copy value**, or copy the `<token>` string from inside
+   `"value"` directly.
 
 A token is a full account credential. Treat it like a password; do not commit it or share
 it.
+
+### Getting a second token (multiple accounts)
+
+If you list several tokens in one API key, do **not** use the same browser profile and log
+out / log in to switch accounts — logging out invalidates the previous token. Instead open
+a **separate incognito / private window** for each account and log in there:
+
+```
+normal window       → account 1 → userToken 1
+incognito window A  → account 2 → userToken 2
+incognito window B  → account 3 → userToken 3
+```
+
+Each window keeps its own session, so all tokens stay valid at the same time. Then join
+them with commas into one API key — see [Format](#format) below.
 
 ### Format
 
