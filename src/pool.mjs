@@ -295,19 +295,31 @@ async function verifyEntry(entry, { signal } = {}) {
  * Takes one account out of the pool for the duration of a request.
  *
  * @param {string[]} tokens the request's token list (already split and de-duplicated)
+ * @param {{ signal?: AbortSignal, exclude?: Set<string> }} [options]
+ *   `exclude` holds token digests that must NOT be handed out. A caller retrying a failed
+ *   request passes the accounts it has already burned, so each attempt lands on a
+ *   DIFFERENT account. When every token is excluded the pool is exhausted for that request.
  * @returns {Promise<{entry: object, auth: object, release: () => void}>}
  *   `release()` is idempotent and MUST be called (try/finally) or the account stays locked.
  * @throws POOL_EMPTY     (503) the request listed no tokens
- * @throws POOL_EXHAUSTED (503) every listed token was rejected
+ * @throws POOL_EXHAUSTED (503) every listed token was rejected, or all were excluded
  * @throws POOL_THROTTLED (429) every listed account is in a DeepSeek cooldown
  * @throws POOL_TIMEOUT   (504) nothing became free in time / the client gave up
  */
-export async function acquireToken(tokens, { signal } = {}) {
-  const entries = (tokens ?? []).map(entryFor)
-  if (entries.length === 0) {
+export async function acquireToken(tokens, { signal, exclude } = {}) {
+  const all = (tokens ?? []).map(entryFor)
+  if (all.length === 0) {
     throw poolError(
       'POOL_EMPTY',
       'No DeepSeek tokens in the API key. Send them comma-separated: Authorization: Bearer tok1,tok2,tok3',
+    )
+  }
+  // Rotation: never hand back an account this request has already tried and abandoned.
+  const entries = exclude?.size ? all.filter((entry) => !exclude.has(entry.hash)) : all
+  if (entries.length === 0) {
+    throw poolError(
+      'POOL_EXHAUSTED',
+      'Every DeepSeek token in this API key was tried for this request and failed.',
     )
   }
 

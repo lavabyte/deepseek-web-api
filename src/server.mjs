@@ -43,6 +43,7 @@ import './env.mjs'
 
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { MODEL_ID } from './deepseek.mjs'
 import { log, clientIp, tokenPrefix } from './log.mjs'
 import { ensureSession, tokenKey, DATA_DIR } from './session.mjs'
@@ -54,8 +55,17 @@ import { muteToken, DEFAULT_COOLDOWN_MS } from './ratelimit.mjs'
 const PORT = Number(process.env.PORT || 8787)
 const HOST = process.env.HOST || '127.0.0.1'
 const CREATED_AT = Math.floor(Date.now() / 1000)
-/** How many OTHER accounts a request may be moved to after its account turns out to be dead. */
-const POOL_RETRIES = Math.max(0, Number(process.env.POOL_RETRIES || 1))
+/**
+ * How many accounts one request may try before giving up.
+ *
+ * On failure the request ROTATES to the next account in the pool, so up to this many
+ * DIFFERENT accounts are tried. Once a full pass over the key's accounts has failed, the
+ * last error is returned instead of retrying forever. With fewer tokens than this, one
+ * pass over all of them is the limit.
+ */
+const POOL_ATTEMPTS = Math.max(1, Number(process.env.POOL_ATTEMPTS || 3))
+/** Small pause between rotation attempts so a sick account is not immediately hammered again. */
+const ROTATE_DELAY_MS = Math.max(0, Number(process.env.POOL_ROTATE_DELAY_MS || 400))
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -105,6 +115,8 @@ async function readJsonBody(req, limitBytes = 64 * 1024 * 1024) {
 /** Internal error code -> HTTP response in OpenAI format. */
 function httpStatusFor(error) {
   const code = error?.code || error?.failure?.code
+  // An empty PoW body is upstream trouble: 503 so clients retry, rather than a 500.
+  if (isServerBusyError(error)) return 503
   if (code === 'AUTH' || code === 'MISSING_CREDENTIAL') return 401
   if (code === 'RATE_LIMIT' || code === 'POOL_THROTTLED' || code === 'quota_exceeded') return 429
   if (code === 'TIMEOUT' || code === 'POOL_TIMEOUT') return 504
@@ -136,6 +148,27 @@ function errorMessage(error) {
   const base = error?.message ?? String(error)
   const retry = error?.failure?.providerRetryAfterMs ?? error?.providerRetryAfterMs
   return retry ? `${base} (retry after ~${Math.ceil(retry / 1000)}s)` : base
+}
+
+/**
+ * Message returned to the CLIENT for a transient upstream failure.
+ *
+ * DeepSeek's edge occasionally answers the PoW challenge with a completely empty body
+ * (see webapi.ts). After the retry ladder and the account rotation are both exhausted,
+ * that is not the caller's fault and not something they can act on — it is simply the
+ * upstream being temporarily unavailable. Such a final error is reported as a plain
+ * "Server Busy" (HTTP 503) instead of leaking the internal PoW detail.
+ *
+ * Logs still carry the full, detailed `errorMessage` so the real cause is traceable.
+ */
+const SERVER_BUSY_MESSAGE = 'Server Busy'
+
+function isServerBusyError(error) {
+  return /PoW challenge returned non-JSON \(empty body\)/i.test(String(error?.message ?? ''))
+}
+
+function publicErrorMessage(error) {
+  return isServerBusyError(error) ? SERVER_BUSY_MESSAGE : errorMessage(error)
 }
 
 /** Account-wide request budget exceeded — the client's fault, and it must not mute DeepSeek. */
@@ -332,12 +365,16 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
     : true
   const search = body?.web_search === true
 
-  // ── Non-streaming: nothing has been sent yet, so a dead account can be swapped out ──
+  // ── Non-streaming: nothing has been sent yet, so the request may rotate between accounts ──
+  // Up to POOL_ATTEMPTS accounts are tried; each attempt excludes the ones already burned,
+  // so the retry lands on a DIFFERENT account. If one full pass still fails, the last error
+  // is returned instead of looping forever.
   if (!stream) {
+    const tried = new Set()
     for (let attempt = 0; ; attempt++) {
       let lease
       try {
-        lease = await acquireToken(allowed, { signal: controller.signal })
+        lease = await acquireToken(allowed, { signal: controller.signal, exclude: tried })
         setPoolEntry(lease.entry)
         const quota = consumeQuota(lease.entry.hash)
         if (!quota.allowed) throw quotaError(quota)
@@ -355,13 +392,23 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
         return
       } catch (error) {
         reportOutcome(lease?.entry, error)
-        // Only a RETIRED account is worth another try — and only if one is left to try.
-        if (!lease || lease.entry.state !== 'dead' || attempt >= POOL_RETRIES) throw error
-        log.warn('account rejected — retrying on another one', {
+        // Never rotate on a client abort — the caller is gone, so the request is over.
+        if ((error?.code ?? error?.failure?.code) === 'ABORTED') throw error
+        // The pool itself has nothing left to hand out (every account exhausted/throttled):
+        // that IS the final answer, not a reason to spin.
+        const code = error?.code ?? error?.failure?.code
+        if (code === 'POOL_EXHAUSTED' || code === 'POOL_EMPTY' || code === 'POOL_THROTTLED' || code === 'POOL_TIMEOUT') throw error
+        if (lease) tried.add(lease.entry.hash)
+        // Stop once the attempt budget is spent OR every account has already been tried.
+        if (attempt + 1 >= POOL_ATTEMPTS || tried.size >= allowed.length) throw error
+        log.warn('request failed — rotating to another account', {
           id,
-          account_index: lease.entry.index,
+          account_index: lease?.entry?.index,
           attempt: attempt + 1,
+          of: POOL_ATTEMPTS,
+          error: errorMessage(error),
         })
+        if (ROTATE_DELAY_MS) await sleep(ROTATE_DELAY_MS).catch(() => {})
       } finally {
         lease?.release()
       }
@@ -369,16 +416,53 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
   }
 
   // ── Streaming ─────────────────────────────────────────────────────────
-  // The account must be settled BEFORE the SSE head goes out: once the status line is on
-  // the wire an error can no longer become an HTTP error, it has to be an SSE event.
-  const lease = await acquireToken(allowed, { signal: controller.signal })
-  setPoolEntry(lease.entry)
+  // ROTATION: a failure is only recoverable BEFORE the SSE head goes out. Once the status
+  // line is on the wire the HTTP code can no longer change, so a later error has to be an
+  // SSE event. Therefore the FIRST event of the generator is awaited here ("primed"): if
+  // that first step fails, the account is swapped and the SSE head is never written.
+  const base = { id, object: 'chat.completion.chunk', created, model }
+  const chunk = (delta, finishReason = null) => ({ ...base, choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }] })
+
+  const tried = new Set()
+  let lease = null
+  let generator = null
+  let firstEvent = null
+  let firstDone = false
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      lease = await acquireToken(allowed, { signal: controller.signal, exclude: tried })
+      setPoolEntry(lease.entry)
+      const quota = consumeQuota(lease.entry.hash)
+      if (!quota.allowed) throw quotaError(quota)
+
+      generator = startCompletion(lease, { body, messages, thinking, search, signal: controller.signal })
+      // Prime the first SSE event. Any failure up to here is pre-stream and rotatable.
+      const first = await generator[Symbol.asyncIterator]().next()
+      firstEvent = first.value ?? null
+      firstDone = first.done === true
+      break
+    } catch (error) {
+      reportOutcome(lease?.entry, error)
+      if ((error?.code ?? error?.failure?.code) === 'ABORTED') throw error
+      const code = error?.code ?? error?.failure?.code
+      if (code === 'POOL_EXHAUSTED' || code === 'POOL_EMPTY' || code === 'POOL_THROTTLED' || code === 'POOL_TIMEOUT') throw error
+      if (lease) tried.add(lease.entry.hash)
+      if (attempt + 1 >= POOL_ATTEMPTS || tried.size >= allowed.length) throw error
+      log.warn('stream failed before the first event — rotating to another account', {
+        id,
+        account_index: lease?.entry?.index,
+        attempt: attempt + 1,
+        of: POOL_ATTEMPTS,
+        error: errorMessage(error),
+      })
+      lease?.release()
+      lease = null
+      if (ROTATE_DELAY_MS) await sleep(ROTATE_DELAY_MS).catch(() => {})
+    }
+  }
+
   try {
-    const quota = consumeQuota(lease.entry.hash)
-    if (!quota.allowed) throw quotaError(quota)
-
-    const generator = startCompletion(lease, { body, messages, thinking, search, signal: controller.signal })
-
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
@@ -386,12 +470,10 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
       'x-accel-buffering': 'no',
     })
 
-    const base = { id, object: 'chat.completion.chunk', created, model }
     const write = (payload) => {
       if (res.writableEnded) return
       res.write(`data: ${JSON.stringify(payload)}\n\n`)
     }
-    const chunk = (delta, finishReason = null) => ({ ...base, choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }] })
 
     // First delta with the role + heartbeat, so clients do not consider the connection dead.
     write(chunk({ role: 'assistant', content: '' }))
@@ -404,22 +486,30 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
     let finishReason = 'stop'
     let usage
 
+    const emit = (event) => {
+      if (event.type === 'text') {
+        write(chunk({ content: event.text }))
+      } else if (event.type === 'thinking') {
+        write(chunk({ reasoning_content: event.text }))
+      } else if (event.type === 'tool_call') {
+        const index = toolIndex++
+        write(chunk({ tool_calls: [{ index, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] }))
+        // Arguments go as a separate delta — that is what OpenAI does too.
+        write(chunk({ tool_calls: [{ index, function: { arguments: event.arguments } }] }))
+      } else if (event.type === 'usage') {
+        usage = event.usage
+      } else if (event.type === 'finish') {
+        finishReason = event.reason
+      }
+    }
+
     try {
-      for await (const event of generator) {
-        if (event.type === 'text') {
-          write(chunk({ content: event.text }))
-        } else if (event.type === 'thinking') {
-          write(chunk({ reasoning_content: event.text }))
-        } else if (event.type === 'tool_call') {
-          const index = toolIndex++
-          write(chunk({ tool_calls: [{ index, id: event.id, type: 'function', function: { name: event.name, arguments: '' } }] }))
-          // Arguments go as a separate delta — that is what OpenAI does too.
-          write(chunk({ tool_calls: [{ index, function: { arguments: event.arguments } }] }))
-        } else if (event.type === 'usage') {
-          usage = event.usage
-        } else if (event.type === 'finish') {
-          finishReason = event.reason
-        }
+      const iterator = generator[Symbol.asyncIterator]()
+      if (!firstDone && firstEvent !== null) emit(firstEvent)
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) break
+        emit(next.value)
       }
       write(chunk({}, finishReason))
       write({ ...base, choices: [], usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })
@@ -435,7 +525,7 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
         log.warn('rate limit cooldown started', { id, token: lease.entry.prefix, cooldown_ms: Math.round(muted) })
       }
       // The stream has already started — the HTTP code cannot change. Send the error as an event.
-      write({ error: { message: errorMessage(error), type: openAiErrorType(status), code: error?.code ?? error?.failure?.code ?? 'provider_error' } })
+      write({ error: { message: publicErrorMessage(error), type: openAiErrorType(status), code: error?.code ?? error?.failure?.code ?? 'provider_error' } })
     } finally {
       clearInterval(heartbeat)
     }
@@ -444,7 +534,7 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
     if (!res.headersSent) throw error
     log.error('stream failed after the response had started', { id, message: errorMessage(error) })
   } finally {
-    lease.release()
+    lease?.release()
     // Only close an SSE response we actually opened — a pre-stream failure (quota, pool
     // error) must be left alone so the router can reply with a real HTTP status.
     if (res.headersSent && !res.writableEnded) {
@@ -559,7 +649,7 @@ const server = createServer(async (req, res) => {
         cooldown_ms: Math.round(muted),
       })
     }
-    sendError(res, status, errorMessage(error), {
+    sendError(res, status, publicErrorMessage(error), {
       type: openAiErrorType(status),
       code: error?.code ?? error?.failure?.code ?? null,
       headers,

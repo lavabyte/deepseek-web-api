@@ -125,6 +125,13 @@ pool spreads requests across the accounts:
 - each token is verified once on first use, so an expired entry fails fast on that account
   instead of poisoning every request.
 
+**Rotation on failure.** If a request fails, it is automatically retried on the **next**
+account instead of the same unlucky one (`POOL_ATTEMPTS`, default 3). Once every account in
+the key has been tried and the whole pass still fails, the last error is returned rather
+than looping forever. For streaming, rotation only happens **before** the first SSE event —
+after the response head is sent the HTTP status can no longer change, so a later error is
+delivered as an SSE error event instead.
+
 Sessions, rate-limit cooldowns and quotas are keyed by the **individual** token digest, so
 two accounts listed in one key never collide. A single token with no comma behaves exactly
 as before.
