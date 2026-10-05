@@ -160,11 +160,11 @@ try {
   // ── 1. /v1/models ─────────────────────────────────────────────────────
   const models = await (await fetch(`${BASE}/v1/models`)).json()
   check('GET /v1/models returns a list with one model', models?.object === 'list' && models.data?.length === 1, JSON.stringify(models?.data?.map((m) => m.id)))
-  check('model id is deepseek/deepseek-v4-flash', models?.data?.[0]?.id === 'deepseek/deepseek-v4-flash', models?.data?.[0]?.id)
+  check('model id is deepseek/deepseek-v4.1-flash', models?.data?.[0]?.id === 'deepseek/deepseek-v4.1-flash', models?.data?.[0]?.id)
 
   // ── 2. non-streaming ──────────────────────────────────────────────────
   const plain = await chat({
-    model: 'deepseek/deepseek-v4-flash',
+    model: 'deepseek/deepseek-v4.1-flash',
     messages: [{ role: 'user', content: 'Answer with exactly one word: PONG' }],
   })
   check('non-stream: HTTP 200', plain.status === 200, String(plain.status))
@@ -175,7 +175,7 @@ try {
 
   // ── 3. streaming ──────────────────────────────────────────────────────
   const streamed = await chat({
-    model: 'deepseek/deepseek-v4-flash',
+    model: 'deepseek/deepseek-v4.1-flash',
     stream: true,
     messages: [{ role: 'user', content: 'Count from 1 to 3, digits only.' }],
   })
@@ -198,7 +198,7 @@ try {
 
   // ── 5. image ──────────────────────────────────────────────────────────
   const vision = await chat({
-    model: 'deepseek/deepseek-v4-flash',
+    model: 'deepseek/deepseek-v4.1-flash',
     messages: [
       {
         role: 'user',
@@ -215,7 +215,7 @@ try {
   // ── 6. text file ──────────────────────────────────────────────────────
   const docBody = 'Report. MARKER-SMOKE: FILE-9182. End.'
   const fileCall = await chat({
-    model: 'deepseek/deepseek-v4-flash',
+    model: 'deepseek/deepseek-v4.1-flash',
     messages: [
       {
         role: 'user',
@@ -231,7 +231,7 @@ try {
 
   // ── 7. tools ──────────────────────────────────────────────────────────
   const toolCall = await chat({
-    model: 'deepseek/deepseek-v4-flash',
+    model: 'deepseek/deepseek-v4.1-flash',
     messages: [{ role: 'user', content: 'What is the weather in Warsaw? Use the tool.' }],
     tools: [
       {
@@ -267,7 +267,7 @@ try {
   const noAuth = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: 'test' }] }),
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'test' }] }),
   })
   check('missing API key -> 401', noAuth.status === 401, String(noAuth.status))
   const badAuth = await fetch(`${BASE}/health`, { headers: { authorization: 'Bearer not-a-real-token' } })

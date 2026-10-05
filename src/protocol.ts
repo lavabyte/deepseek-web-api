@@ -547,7 +547,10 @@ function normalizeDsml(text: string): string {
 const JSON_MARKER_STARTERS = ['{"tool_calls"', '{"tool_call"']
 
 /** XML marker prefixes (used for cross-chunk hold-back decisions). `calls` is the degraded wrapper name seen in measurements. */
-const XML_MARKER_STARTERS = ['<tool_calls', '<tool_call', '<function_calls', '<calls', '<invoke', '<dsml-tool_calls', '<dsml-invoke']
+const XML_MARKER_STARTERS = [
+  '<tool_calls', '<tool_call', '<function_calls', '<calls', '<invoke', '<tool_calls', '<invoke',
+  '</tool_calls', '</tool_call', '</function_calls', '</calls', '</invoke', '</parameter',
+]
 
 /**
  * Decides whether the end of `text` is a (possible) marker prefix — i.e. whether to hold back.
@@ -583,6 +586,12 @@ function partialMarkerSuffixLength(text: string): number {
     // and the next few characters completed it into `<calls>` — garbage in the visible
     // reply. Fallback: strip the pipes and `dsml` from the candidate and see whether it is a
     // prefix of some starter.
+    // A DSML marker still being typed. The pipe is DeepSeek's private notation that cannot
+    // appear in a normal answer, so while no closing angle bracket has arrived the tail is
+    // safe to hold. Without this a stray closer streamed into the body one character at a
+    // time (measured 2026-10-04): the leading bracket and slash were released before the
+    // whole tag existed, so stripStrayToolMarkup never saw it.
+    if (!normalized.includes('>') && /^<\/?\s*(?:[|｜]|dsml)/i.test(normalized)) return held
     const loose = lower.replace(/[|｜]|dsml/g, '')
     if (/^<\/?[a-z_]*$/.test(loose) && XML_MARKER_STARTERS.some((starter) => starter.startsWith(loose))) {
       return held

@@ -8,7 +8,7 @@ An **OpenAI-API-compatible** HTTP server that uses a `chat.deepseek.com` web ses
 instead of an official API key. It exposes one model:
 
 ```
-deepseek/deepseek-v4-flash
+deepseek/deepseek-v4.1-flash
 ```
 
 It works with any OpenAI client (LangChain, LlamaIndex, Cline, Continue, curl, the
@@ -47,7 +47,7 @@ token(s) as the API key:
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer <token-from-chat.deepseek.com>" \
   -H "content-type: application/json" \
-  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 Environment variables are optional — every one has a working default. Want to change

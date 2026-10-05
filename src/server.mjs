@@ -17,7 +17,7 @@
  * by the individual token digest, so everything lines up.
  *
  * Endpoints:
- *   GET  /v1/models               -> model list (one: deepseek/deepseek-v4-flash)
+ *   GET  /v1/models               -> model list (one: deepseek/deepseek-v4.1-flash)
  *   POST /v1/chat/completions     -> chat (stream=true and false)
  *   GET  /health                  -> token-pool state (?verify=1 forces a live re-check)
  *

@@ -30,7 +30,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 export { DS_BASE }
 
 /** The model exposed in /v1/models — the only one this server serves. */
-export const MODEL_ID = process.env.MODEL_ID || 'deepseek/deepseek-v4-flash'
+export const MODEL_ID = process.env.MODEL_ID || 'deepseek/deepseek-v4.1-flash'
 
 /**
  * Builds the WebAuth object from the session token.
