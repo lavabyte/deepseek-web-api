@@ -550,7 +550,7 @@ export async function* runChatCompletion(options) {
   const prepared = attachmentIndexes.some((index) => index === null)
     ? buildPrompt({ messages, tools, toolChoice, maxChars, attachmentIndexes })
     : discovery
-  const knownTools = new Set(prepared.tools.map((tool) => tool.name))
+  const toolSchemas = new Map(prepared.tools.map((tool) => [tool.name, tool.parameters]))
 
   let prompt = prepared.prompt
   let rounds = 0
@@ -596,7 +596,7 @@ export async function* runChatCompletion(options) {
   for (;;) {
     // Each round gets its OWN filters — the previous round's state is already drained,
     // and sharing buffers across auto-continue would reorder the deltas.
-    const filter = new ToolCallStreamFilter(knownTools)
+    const filter = new ToolCallStreamFilter(toolSchemas)
     const echoGuard = new TranscriptEchoGuard()
     const boilerplate = new BoilerplateFilter()
     // Stateful, so a multi-line block split across SSE chunks is still recognised.

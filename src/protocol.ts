@@ -120,6 +120,7 @@ line2]]></|DSML|parameter>. Prefer keeping commands on ONE line with ; separator
 9. NEVER reproduce the transcript. Do not restate previous turns, "[Tool Result ...]" blocks, tool output, or the current prompt. Emit ONLY the calls you want to run right now.
 10. Keep each batch SMALL — at most 3 calls, and prefer exactly 1. If you need more, send them in successive steps.
 11. Each call must be able to run on its own: no shared shell variables across calls, no dependence on another call in the same batch.
+12. Write EVERY parameter with its complete opening tag (<parameter name="..." string="true">) and its closing tag (</parameter>). Never shorten, split, or drop the opening tag — a mangled tag hides the parameter from the parser and the call fails validation. Emit every field the tool's JSON Schema marks as required, even when the value is empty.
 `
 
 function truncate(text: string, max: number): string {
@@ -1030,7 +1031,14 @@ function escapeInvalidEscapes(body: string): string {
 function parseParameterValue(raw: string): unknown {
   let text = raw.trim()
   const cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(text)
-  if (cdata) text = cdata[1]
+  if (cdata) {
+    text = cdata[1]
+  } else if (text.startsWith('<![CDATA[')) {
+    // Opener without a closer (stream cut, or the model forgot the tail): strip it so the
+    // literal opener never reaches the executed command. Measured 2026-10-07 (user report:
+    // a bash command arrived prefixed with the raw CDATA opener).
+    text = text.slice('<![CDATA['.length).replace(/\]\]?$/, '')
+  }
   if (text === '') return ''
   const parsed = parseJsonLenient(text)
   return parsed === undefined ? text : parsed
@@ -1050,29 +1058,12 @@ export function parseXmlToolCalls(block: string): ToolCallRequest[] | null {
     const name = readAttr(invoke[1], 'name')
     if (!name) continue
     const body = invoke[2]
-    const args: Record<string, unknown> = {}
-    let sawParam = false
-    const paramRe = new RegExp(`${TAG_OPEN_PREFIX}parameter\\b([^>]*)>([\\s\\S]*?)${TAG_CLOSE_PREFIX}parameter\\s*>`, 'gi')
-    let param: RegExpExecArray | null
-    while ((param = paramRe.exec(body)) !== null) {
-      const key = readAttr(param[1], 'name')
-      if (!key) continue
-      sawParam = true
-      args[key] = parseParameterValue(param[2])
-    }
-    if (!sawParam) {
-      // no parameter child elements: try the body as JSON arguments, otherwise keep it as _raw
-      const inner = body.trim()
-      if (inner) {
-        try {
-          const parsed = JSON.parse(inner)
-          if (parsed && typeof parsed === 'object') Object.assign(args, parsed as Record<string, unknown>)
-          else args._raw = parsed
-        } catch {
-          args._raw = inner
-        }
-      }
-    }
+    // Parameters are split on their OPEN tags, never on "open ... close" pairs. When the model
+    // omits a closer (or the stream is cut), the pair regex silently dropped that parameter or let
+    // it swallow the next one — measured 2026-10-09 as the source of the harness errors
+    // "missing required property description" / "... command" even though the model HAD emitted
+    // the value. Splitting on openers recovers every parameter and keeps values clean.
+    const args: Record<string, unknown> = salvageXmlParameters(body)
     calls.push({
       id: `call_${randomUUID().replace(/-/g, '').slice(0, 20)}`,
       name,
@@ -1123,13 +1114,41 @@ function salvageXmlToolCalls(text: string): ToolCallRequest[] | null {
   return calls.length > 0 ? calls : null
 }
 
+/**
+ * Repairs parameter open tags whose `parameter name=` prefix was lost.
+ *
+ * Measured 2026-10-09 (user report: `Query runtime` + `listService` -> "missing required property
+ * provider"). The model wrote the platform parameter normally, then a second opener that lost
+ * everything up to its attribute quote and degraded to a bare tag carrying only `string="true"`.
+ * The value scanner saw no boundary there, so `platform` swallowed the fragment and the REQUIRED
+ * `provider` key vanished. The `string="true"` remnant is unique to this protocol, so matching it
+ * cannot misfire on an ordinary command value.
+ */
+function repairDegradedParameterTags(body: string): string {
+  const prefix = '<|DSML|parameter name="'
+  const suffix = '" string="true">'
+  const restore = (match: string, name: string): string => prefix + name + suffix
+  return body
+    .replace(/<\s*([A-Za-z_][\w.-]*)\s*"\s*string\s*=\s*"true"\s*>/g, restore)
+    .replace(/<\s*([A-Za-z_][\w.-]*)\s+string\s*=\s*"true"\s*>/g, restore)
+}
+
 /** Extracts parameters from a broken invoke body: split on open tags, take each value up to the next open tag or segment end. */
 function salvageXmlParameters(body: string): Record<string, unknown> {
+  body = repairDegradedParameterTags(body)
   const args: Record<string, unknown> = {}
   const paramStartRe = new RegExp(`${TAG_OPEN_PREFIX}parameter\\b([^>]*)>`, 'gi')
+  // An open tag inside a CDATA value is DATA, not structure: a command that itself contains the
+  // protocol markup must not be split. Collect CDATA spans first and skip matches inside them.
+  const cdataSpans: { start: number; end: number }[] = []
+  const cdataRe = /<!\[CDATA\[[\s\S]*?\]\]>/g
+  let cdata: RegExpExecArray | null
+  while ((cdata = cdataRe.exec(body)) !== null) cdataSpans.push({ start: cdata.index, end: cdataRe.lastIndex })
+  const insideCdata = (i: number) => cdataSpans.some((s) => i >= s.start && i < s.end)
   const found: { start: number; end: number; key: string }[] = []
   let match: RegExpExecArray | null
   while ((match = paramStartRe.exec(body)) !== null) {
+    if (insideCdata(match.index)) continue
     const key = readAttr(match[1], 'name')
     if (key) found.push({ start: match.index, end: paramStartRe.lastIndex, key })
   }
@@ -1149,6 +1168,61 @@ function salvageXmlParameters(body: string): Record<string, unknown> {
     }
   }
   return args
+}
+
+/**
+ * Fills tool arguments the model left out, using the tool's JSON Schema.
+ *
+ * Measured 2026-10-09 (user request: "let it complete all fields"): the runner rejects a call
+ * with `missing required property "provider"` even though the model produced a usable call and
+ * only one parameter tag was mangled. The parser now recovers mangled parameters (see
+ * `repairDegradedParameterTags`); this is the second line of defence — a REQUIRED property that
+ * is still absent gets a value from the schema (`default`, else the first `enum` value, else the
+ * zero value of its type), so the call reaches the tool instead of failing validation.
+ *
+ * Only required properties and properties that declare a `default` are filled. Inventing values
+ * for OPTIONAL properties would change tool semantics (an optional filter sent as "" is not the
+ * same as an omitted filter), so those are left alone.
+ */
+export function fillMissingToolArguments(
+  args: Record<string, unknown>,
+  schema: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const properties = schema?.properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return args
+  const props = properties as Record<string, any>
+  const required = Array.isArray(schema?.required)
+    ? (schema?.required as unknown[]).filter((key): key is string => typeof key === 'string')
+    : []
+  const out: Record<string, unknown> = { ...args }
+  for (const key of Object.keys(props)) {
+    if (out[key] !== undefined) continue
+    if (required.includes(key)) out[key] = defaultValueForSchema(props[key])
+    else if (props[key] && typeof props[key] === 'object' && props[key].default !== undefined) {
+      out[key] = props[key].default
+    }
+  }
+  return out
+}
+
+/** Zero value for a JSON Schema type — used only when a REQUIRED property is missing. */
+function defaultValueForSchema(schema: any): unknown {
+  if (!schema || typeof schema !== 'object') return ''
+  if (schema.default !== undefined) return schema.default
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0]
+  switch (schema.type) {
+    case 'number':
+    case 'integer':
+      return 0
+    case 'boolean':
+      return false
+    case 'array':
+      return []
+    case 'object':
+      return {}
+    default:
+      return ''
+  }
 }
 
 /** Strips leftover closing tags and whitespace from the end of a value. */
@@ -1356,10 +1430,32 @@ export class ToolCallStreamFilter {
    * a trailing fragment is extra model output (drop it) and must never trigger a whole-round retry.
    */
   private emittedCall = false
-  private readonly knownTools?: ReadonlySet<string>
+  /** name -> JSON Schema of the tool, used to complete parameters the model omitted. */
+  private readonly toolSchemas?: ReadonlyMap<string, Record<string, unknown>>
 
-  constructor(knownTools?: ReadonlySet<string>) {
-    this.knownTools = knownTools
+  constructor(toolSchemas?: ReadonlyMap<string, Record<string, unknown>>) {
+    this.toolSchemas = toolSchemas
+  }
+
+  /**
+   * Fills parameters the model left out, using the tool's JSON Schema (see
+   * `fillMissingToolArguments`). Runs on every parsed call, both mid-stream and at flush.
+   */
+  private completeArguments(calls: ToolCallRequest[]): ToolCallRequest[] {
+    if (!this.toolSchemas || this.toolSchemas.size === 0) return calls
+    return calls.map((call) => {
+      const schema = this.toolSchemas?.get(call.name)
+      if (!schema) return call
+      let args: unknown
+      try {
+        args = JSON.parse(call.arguments)
+      } catch {
+        return call
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) return call
+      const filled = fillMissingToolArguments(args as Record<string, unknown>, schema)
+      return { ...call, arguments: JSON.stringify(filled) }
+    })
   }
 
   /** Appends released text and advances the tracked markdown code context. */
@@ -1399,7 +1495,7 @@ export class ToolCallStreamFilter {
         captured.mode === 'xml' ? parseXmlToolCalls(captured.buffer) : parseSalvagedToolCallJson(captured.buffer)
       if (calls) {
         this.emittedCall = true
-        out.calls.push(...calls)
+        out.calls.push(...this.completeArguments(calls))
       }
       // WARNING: user-measured: the model often emits a COMPLETE body of text with a broken
       // protocol fragment at the end (e.g. a stray `{` after the answer, or a truncated second
@@ -1459,7 +1555,7 @@ export class ToolCallStreamFilter {
           const calls = parseXmlToolCalls(block)
           if (calls) {
             this.emittedCall = true
-            out.calls.push(...calls)
+            out.calls.push(...this.completeArguments(calls))
           } else if (!this.emittedCall && looksLikeToolCallBlock('xml', block)) this.abandoned ??= { raw: block, mode: 'xml', reason: 'unparsable' }
           else if (!this.emittedCall) out.text += stripStrayToolMarkup(block)
           this.capture = null
@@ -1483,7 +1579,7 @@ export class ToolCallStreamFilter {
           // unknown tool names are emitted as usual: the runner produces an 'unknown tool'
           // result and the model can correct itself.
           this.emittedCall = true
-          out.calls.push(...calls)
+          out.calls.push(...this.completeArguments(calls))
           this.capture = null
           this.pending = captured.buffer.slice(balanced.end).replace(FENCE_HEAD_RE, '') + this.pending
           continue
