@@ -1,7 +1,7 @@
 # DeepSeek Web API
 
 ### Notice
-This entire project was vide-coded with DeepSeek V4.1 Flash
+This entire project was vibe-coded with DeepSeek V4.1 Flash
 <br><br><br>
 
 An **OpenAI-API-compatible** HTTP server that uses a `chat.deepseek.com` web session
