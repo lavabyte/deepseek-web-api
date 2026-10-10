@@ -1,7 +1,7 @@
 # DeepSeek Web API
 
 ### Notice
-This entire project was vibe-coded with DeepSeek V4.1 Flash
+This entire project was vide-coded with DeepSeek V4.1 Flash
 <br><br><br>
 
 An **OpenAI-API-compatible** HTTP server that uses a `chat.deepseek.com` web session
@@ -13,6 +13,34 @@ deepseek/deepseek-v4.1-flash
 
 It works with any OpenAI client (LangChain, LlamaIndex, Cline, Continue, curl, the
 Python/JS SDKs).
+
+## Two run modes
+
+The server can source its DeepSeek sessions in two ways. The mode is chosen entirely from
+`.env`; the code path is otherwise identical.
+
+| | **Client mode** (default) | **Server mode** |
+|---|---|---|
+| Trigger | `DEEPSEEK_TOKENS` empty | at least one token in `DEEPSEEK_TOKENS` |
+| Credential | the caller's API key **is** the tokens | the operator's pool in `.env` |
+| Client sends | `Authorization: Bearer tok1,tok2,tok3` | `Authorization: Bearer <API_KEY>`, or nothing |
+| Server stores a secret | no | the tokens (and `API_KEY`, if set) |
+
+**Client mode** — each caller brings their own `chat.deepseek.com` account(s). This is the
+upstream default: the server holds no credential.
+
+**Server mode** — the operator fills `DEEPSEEK_TOKENS` and every client shares that pool.
+`API_KEY` may stay empty (anyone who can reach the port — the LAN / Tailscale case) or hold
+a key every client must present:
+
+```bash
+DEEPSEEK_TOKENS=tok1,tok2,tok3
+API_KEY=sk-my-private-key      # or leave empty for a private network
+```
+
+A non-empty `API_KEY` is compared in constant time; a missing or wrong key is `401`.
+Tokens in the pool are verified **lazily** on first use, so boot never blocks on DeepSeek.
+`HOME_TOKENS` is accepted as an alias for `DEEPSEEK_TOKENS`.
 
 ## Quick start
 
@@ -40,8 +68,8 @@ npm start           # if you have npm
 node src/server.mjs # or directly
 ```
 
-The server listens on `http://127.0.0.1:8787`. Pass your `chat.deepseek.com` session
-token(s) as the API key:
+The server listens on `http://127.0.0.1:8787`. By default (client mode) you pass your
+`chat.deepseek.com` session token(s) as the API key:
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -55,8 +83,10 @@ them? Copy `.env.example` to `.env` and edit.
 
 ## API key and token format
 
-The API key **is** a `chat.deepseek.com` session token (or a comma-separated list of
-them). There is no separate key in `.env`, so the server holds no secret.
+In **client mode** (the default) the API key **is** a `chat.deepseek.com` session token
+(or a comma-separated list of them) — there is no separate key in `.env`, so the server
+holds no secret. In **server mode** the tokens live in `DEEPSEEK_TOKENS` and the key is the
+optional `API_KEY`; see [Two run modes](#two-run-modes).
 
 ### Where to get a token
 
@@ -215,6 +245,62 @@ immediately. DeepSeek's limits are handled **reactively**, only when they actual
 In addition, if the server replies `invalid chat session id` or `message count exceeded`,
 the stored session is recreated and the request is retried — the client does not notice.
 
+## Disabling model training
+
+DeepSeek's web client exposes a per-account privacy switch ("Improve the model for
+everyone"). It is written as `training_allowed` on `POST /api/v0/users/update_settings`,
+and a session token alone authorises it — no cookie and no PoW header.
+
+Set:
+
+```bash
+DISABLE_TRAINING=1
+```
+
+On the first successful verification of each account the server flips that switch once.
+This sits in the shared token pool, so it works in **both modes** — server-mode tokens and
+client-supplied ones are verified through the same path. The call is fire-and-forget, so it
+never delays a chat request; a failure clears the flag and is retried on the next
+verification. `/health` reports the outcome per account:
+
+```
+"training": "disabled" | "error" | null
+```
+
+`TRAINING_TIMEOUT_MS` (default 15000) bounds that one-off request.
+
+For a one-off batch over an explicit token list, or to flip the switch without running the
+server, call the endpoint per token:
+
+```bash
+curl https://chat.deepseek.com/api/v0/users/update_settings \
+  -H "Authorization: Bearer <token>" \
+  -H "content-type: application/json" \
+  -d '{"training_allowed": false}'
+```
+
+## Self-update
+
+`AUTO_UPDATE=1` (the default) keeps the checkout in sync with the GitHub repository. After
+boot, and then every `AUTO_UPDATE_INTERVAL_MS` (default 6 h), the server compares its files
+against the repository and downloads only what actually changed, verifying each file against
+its git blob SHA before writing. When files were replaced the process restarts to load them
+(under systemd with `Restart=always` that is automatic).
+
+A file is replaced **only** when all of these hold: it was already in sync with upstream,
+nobody edited it locally since, and the repository now has a different version. Anything else
+is reported and left alone:
+
+- **forked** — the local file differs from upstream (a deliberate fork or a later local
+  edit); the updater will never overwrite it,
+- **conflicts** — a new upstream file whose path already exists locally.
+
+The first run only records a baseline and writes nothing, so an install that already diverges
+cannot lose a file to a first sync. `.env`, `data/` and `tests/.token` are never written.
+State lives in `data/update-state.json`, and `/health` carries an `update` block with the last
+commit and the number of updated / forked / conflicting files. Set `AUTO_UPDATE=0` to
+disable, and `GITHUB_TOKEN` to raise the GitHub API rate limit.
+
 ## Measured context limit
 
 Measured on a live account (2026-09-13), with a fresh session for every measurement — a
@@ -314,6 +400,9 @@ non-stream, stream, one session, image, file, tools.
 | `src/session.mjs` | Persistent session + state persistence + cleanup (TTL, entry cap) |
 | `src/pool.mjs` | Per-request token pool (comma-separated key, account selection, dead-token eviction) |
 | `src/access.mjs` | Access control (allowlist) and per-token quotas |
+| `src/credentials.mjs` | Run mode: client-supplied tokens vs. a `DEEPSEEK_TOKENS` pool, plus the `API_KEY` gate |
+| `src/update.mjs` | Self-update from GitHub (fork-safe: never overwrites locally edited files) |
+| `src/ratelimit.mjs` | Per-account 429 cooldowns, persisted in `data/rate-limits.json` |
 | `src/env.mjs` | Minimal `.env` loader, imported first so every module sees the environment |
 | `src/log.mjs` | Structured logs (JSON), request id, IP behind a proxy |
 | `src/webapi.ts`, `src/protocol.ts`, `src/auth.ts`, `src/gate.ts` | Battle-tested core (PoW WASM, SSE parser, tool protocol, throttling) |
@@ -326,10 +415,11 @@ step and no `node_modules` dependency.
 The full list with descriptions is in `.env.example`. The most important: `PORT` and
 `MAX_PROMPT_CHARS` (default 1 000 000 characters).
 
-The session token is NOT an environment variable — the client passes it as
-`Authorization: Bearer <token>` (the API key), optionally several tokens separated by
-commas. This way the server stores no secret and every client can use their own DeepSeek
-account(s).
+Which variables matter depends on the mode. In **client mode** the session token is not an
+environment variable at all — the client passes it as `Authorization: Bearer <token>` (the
+API key), optionally several tokens separated by commas, so the server stores no secret and
+every client uses their own DeepSeek account(s). In **server mode** the pool is
+`DEEPSEEK_TOKENS` and the client presents `API_KEY` (or nothing, when `API_KEY` is empty).
 
 ## License
 

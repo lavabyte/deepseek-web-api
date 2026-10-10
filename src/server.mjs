@@ -51,6 +51,8 @@ import { runChatCompletion } from './openai.mjs'
 import { acquireToken, poolStatus, verifyPool, reviveTokens, reportOutcome } from './pool.mjs'
 import { accessControlEnabled, isTokenAllowed, consumeQuota, quotaEnabled } from './access.mjs'
 import { muteToken, DEFAULT_COOLDOWN_MS } from './ratelimit.mjs'
+import { resolveTokens, checkAuth, authInfo, rawKeyFromRequest } from './credentials.mjs'
+import { startAutoUpdate, updateStatus, autoUpdateRestartEnabled } from './update.mjs'
 
 const PORT = Number(process.env.PORT || 8787)
 const HOST = process.env.HOST || '127.0.0.1'
@@ -181,32 +183,10 @@ function quotaError(quota) {
 }
 
 /**
- * Raw API key from the request (the `Bearer ` prefix already removed).
- *
- * The key IS the credential — there is no separate API_KEY in .env. `x-api-key` is
- * accepted too, because several OpenAI clients send that header instead.
+ * Credential resolution lives in src/credentials.mjs: it picks between the two run modes
+ * (client-supplied tokens vs. a server-side pool in DEEPSEEK_TOKENS) and enforces API_KEY.
+ * `rawKeyFromRequest` moved there too, so logging and auth read the key the same way.
  */
-function rawKeyFromRequest(req) {
-  const header = String(req.headers.authorization || '')
-  if (header.startsWith('Bearer ')) return header.slice(7).trim()
-  if (header.startsWith('bearer ')) return header.slice(7).trim()
-  return String(req.headers['x-api-key'] || '').trim()
-}
-
-/** Splits the key into individual DeepSeek tokens (Base64, so a comma is never inside one). */
-function tokensFromRequest(req) {
-  const raw = rawKeyFromRequest(req)
-  if (!raw) return []
-  const out = []
-  const seen = new Set()
-  for (const chunk of raw.split(',')) {
-    const token = chunk.trim()
-    if (!token || seen.has(token)) continue
-    seen.add(token)
-    out.push(token)
-  }
-  return out
-}
 
 /** Model as seen by the client. */
 function modelObject() {
@@ -274,15 +254,22 @@ async function handleModels(req, res) {
  * token, never a credential. `?verify=1` forces a live re-check against DeepSeek.
  */
 async function handleHealth(req, res, url) {
-  const tokens = tokensFromRequest(req)
+  const info = authInfo()
+  const tokens = resolveTokens(req)
   if (tokens.length === 0) {
     sendJson(res, 200, {
       ok: true,
-      auth: { required: true, source: 'comma-separated API key', hint: 'Authorization: Bearer tok1,tok2,tok3' },
+      auth: {
+        ...info,
+        hint: info.mode === 'client'
+          ? 'Authorization: Bearer tok1,tok2,tok3'
+          : 'set DEEPSEEK_TOKENS in .env',
+      },
       pool: poolStatus([]),
       model: MODEL_ID,
       uptime_s: Math.round(process.uptime()),
       data_dir: DATA_DIR,
+      update: updateStatus(),
     })
     return
   }
@@ -296,11 +283,12 @@ async function handleHealth(req, res, url) {
 
   sendJson(res, status.usable > 0 ? 200 : 503, {
     ok: status.usable > 0,
-    auth: { required: true, source: 'comma-separated API key', tokens_in_key: tokens.length },
+    auth: { ...info, ...(info.mode === 'client' ? { tokens_in_key: tokens.length } : {}) },
     pool: status,
     model: MODEL_ID,
     uptime_s: Math.round(process.uptime()),
     data_dir: DATA_DIR,
+    update: updateStatus(),
   })
 }
 
@@ -326,12 +314,21 @@ async function handleChatCompletions(req, res, body, setPoolEntry) {
     return
   }
 
-  const tokens = tokensFromRequest(req)
+  const auth = checkAuth(req)
+  if (!auth.ok) {
+    sendError(res, auth.status, auth.message, { type: 'authentication_error', code: auth.code })
+    return
+  }
+  const tokens = resolveTokens(req)
   if (tokens.length === 0) {
-    sendError(res, 401, 'Missing API key — send your chat.deepseek.com session token(s) as the API key', {
-      type: 'authentication_error',
-      code: 'invalid_api_key',
-    })
+    sendError(
+      res,
+      401,
+      authInfo().mode === 'server'
+        ? 'No DeepSeek tokens are configured on the server (DEEPSEEK_TOKENS is empty).'
+        : 'Missing API key — send your chat.deepseek.com session token(s) as the API key',
+      { type: 'authentication_error', code: 'invalid_api_key' },
+    )
     return
   }
 
@@ -597,12 +594,12 @@ const server = createServer(async (req, res) => {
       return
     }
     if (method === 'GET' && (path === '/tokens' || path === '/v1/tokens')) {
-      const tokens = tokensFromRequest(req)
+      const tokens = resolveTokens(req)
       sendJson(res, 200, { object: 'list', ...poolStatus(tokens) })
       return
     }
     if (method === 'POST' && (path === '/tokens/revive' || path === '/v1/tokens/revive')) {
-      const tokens = tokensFromRequest(req)
+      const tokens = resolveTokens(req)
       sendJson(res, 200, { object: 'list', ...(await reviveTokens(tokens)) })
       return
     }
@@ -671,7 +668,22 @@ server.listen(PORT, HOST, () => {
     model: MODEL_ID,
     allowlist: accessControlEnabled,
     quota: quotaEnabled,
+    auth: authInfo(),
     dataDir: DATA_DIR,
+  })
+  // Self-update runs AFTER listen, so a slow GitHub API never delays accepting requests.
+  // `onApplied` restarts only when at least one file was replaced and a restart is
+  // configured; SIGTERM goes through the graceful shutdown below, and under systemd
+  // `Restart=always` brings the service straight back on the new code.
+  startAutoUpdate({
+    onApplied: () => {
+      if (!autoUpdateRestartEnabled()) {
+        log.warn('auto-update applied — restart the process to load the new code')
+        return
+      }
+      log.warn('auto-update applied — restarting to load the new code')
+      setTimeout(() => process.kill(process.pid, 'SIGTERM'), 500).unref()
+    },
   })
 })
 

@@ -79,7 +79,9 @@ const RED_PNG_DATA_URL = 'data:image/png;base64,' + solidPng(128, [255, 0, 0]).t
 
 const child = spawn(process.execPath, [join(ROOT, 'src', 'server.mjs')], {
   cwd: ROOT,
-  env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1' },
+  // AUTO_UPDATE=0: the test server must not reach GitHub or write data/update-state.json.
+  // The updater is covered by its own test; a smoke run has to stay offline and repeatable.
+  env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', AUTO_UPDATE: '0' },
   stdio: ['ignore', 'pipe', 'pipe'],
 })
 let serverLog = ''

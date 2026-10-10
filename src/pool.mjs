@@ -33,7 +33,7 @@
 // matters). A no-op when the importer already did it.
 import './env.mjs'
 
-import { authFromToken, verifyToken as verifyWebToken } from './deepseek.mjs'
+import { authFromToken, disableTraining, verifyToken as verifyWebToken } from './deepseek.mjs'
 import { currentSessionId, tokenKey } from './session.mjs'
 import { mutedFor } from './ratelimit.mjs'
 import { quotaStatus } from './access.mjs'
@@ -47,6 +47,10 @@ const QUEUE_TIMEOUT_MS = Number(process.env.POOL_QUEUE_TIMEOUT_MS || 300_000)
 const POLL_MS = 250
 /** `ALLOW_CONCURRENT=1` stops the pool from serialising requests per account. */
 const ALLOW_CONCURRENT = process.env.ALLOW_CONCURRENT === '1'
+/** `DISABLE_TRAINING=1` flips each account's privacy switch to "no training" on first verify. */
+const DISABLE_TRAINING = process.env.DISABLE_TRAINING === '1'
+/** Timeout for that one-off settings request — it must never block a chat. */
+const TRAINING_TIMEOUT_MS = Number(process.env.TRAINING_TIMEOUT_MS || 15_000)
 
 /**
  * Splits the API key into individual DeepSeek tokens.
@@ -101,6 +105,10 @@ function entryFor(token) {
       lastUsedAt: null,
       /** In-flight verification, so N parallel requests do not verify the same token N times. */
       verifying: null,
+      /** `true` once the training switch was turned off for this account this process. */
+      trainingDisabled: false,
+      /** Last training-switch failure, for /health and /tokens. */
+      trainingError: null,
     }
     registry.set(hash, entry)
   }
@@ -269,6 +277,7 @@ async function verifyEntry(entry, { signal } = {}) {
       const who = await verifyWebToken(authFor(entry), controller.signal)
       if (who?.ok) {
         markOk(entry, who.user)
+        ensureTrainingDisabled(entry)
         return true
       }
       const reason = who?.error ?? 'verification failed'
@@ -287,6 +296,37 @@ async function verifyEntry(entry, { signal } = {}) {
     }
   })()
   return entry.verifying
+}
+
+/**
+ * Opt-in (`DISABLE_TRAINING=1`): flips the account's privacy switch to "no training" once,
+ * on the first successful verification.
+ *
+ * Fire-and-forget on purpose: it is a one-off side task, so it must never delay or fail a
+ * chat request. A failure clears the flag so the next verification retries it.
+ */
+function ensureTrainingDisabled(entry) {
+  if (!DISABLE_TRAINING || entry.trainingDisabled) return
+  entry.trainingDisabled = true
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort('training-setting timeout'), TRAINING_TIMEOUT_MS)
+  disableTraining(authFor(entry), controller.signal)
+    .then((result) => {
+      if (result?.ok) {
+        entry.trainingError = null
+        log.info('model training disabled', { index: entry.index, token: entry.prefix, account: entry.account })
+      } else {
+        entry.trainingDisabled = false
+        entry.trainingError = String(result?.error ?? 'unknown error').slice(0, 300)
+        log.warn('disabling model training failed', { index: entry.index, token: entry.prefix, error: entry.trainingError })
+      }
+    })
+    .catch((error) => {
+      entry.trainingDisabled = false
+      entry.trainingError = String(error?.message ?? error).slice(0, 300)
+      log.warn('disabling model training failed', { index: entry.index, token: entry.prefix, error: entry.trainingError })
+    })
+    .finally(() => clearTimeout(timer))
 }
 
 // ── acquisition ─────────────────────────────────────────────────────────
@@ -415,6 +455,9 @@ export function poolStatus(tokens) {
         // The persistent chat session that account is currently bound to (null until the
         // first request) — the two are useful together when a conversation goes wrong.
         session: currentSessionId(entry.hash) ?? null,
+        // Only populated with DISABLE_TRAINING=1: 'disabled' once the switch was turned off,
+        // 'error' when the last attempt failed.
+        training: entry.trainingDisabled ? 'disabled' : entry.trainingError ? 'error' : null,
         quota: quotaStatus(entry.hash),
       }
     }),

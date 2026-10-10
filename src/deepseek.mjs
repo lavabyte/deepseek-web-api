@@ -500,3 +500,27 @@ export async function verifyToken(auth, signal) {
   const user = r.json?.data?.biz_data ?? r.json?.data ?? {}
   return { ok: true, user: { id: user?.id, email: user?.email, mobile: user?.mobile_number } }
 }
+
+/**
+ * Turns OFF model training for this account ("Improve the model for everyone").
+ *
+ * DeepSeek's web client writes that privacy switch as `training_allowed` on
+ * `POST /api/v0/users/update_settings`, and the session token alone authorises it — no
+ * cookie, no PoW header (verified live 2026-10-10: HTTP 200, code 0).
+ *
+ * Used by the home server when `DISABLE_TRAINING=1` (see pool.mjs) and by
+ * `tools/disable-training.py` for a one-off batch over an explicit token list.
+ */
+export async function disableTraining(auth, signal) {
+  const r = await postJson(auth, '/api/v0/users/update_settings', { training_allowed: false }, signal)
+  if (looksLikeHtml(r.text)) return { ok: false, error: 'anti-bot HTML page' }
+  const biz = envelopeError(r.json)
+  if (biz) return { ok: false, error: `${biz.code}: ${biz.msg}` }
+  // WARNING: the envelope keeps the REAL business error in data.biz_code while code is 0.
+  const inner = r.json?.data
+  if (inner && typeof inner === 'object' && Number(inner.biz_code) > 0) {
+    return { ok: false, error: `${inner.biz_code}: ${inner.biz_msg ?? 'unknown error'}` }
+  }
+  if (r.status !== 200) return { ok: false, error: `HTTP ${r.status}` }
+  return { ok: true }
+}
