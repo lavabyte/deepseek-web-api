@@ -1,5 +1,9 @@
 # DeepSeek Web API
 
+## Discontinued
+### Use [DeepAI Gateway](https://github.com/lavabyte/deepai-gateway)
+
+
 ### Notice
 This entire project was vide-coded with DeepSeek V4.1 Flash
 <br><br><br>
